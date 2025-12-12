@@ -1,0 +1,5 @@
+{
+  "name": "GigMaster",
+  "description": "Offline-capable sheet music reader with setlist management, annotations, and bluetooth pedal support.",
+  "requestFramePermissions": []
+}
