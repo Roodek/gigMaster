@@ -1,816 +1,717 @@
-import React, { useState, useEffect, useRef } from 'react';
-import { ChevronLeft, ChevronRight, PenTool, Eraser, Undo, X, Settings2, Trash2, ChevronDown, Sliders, List, FileText, GripHorizontal, Palette } from 'lucide-react';
-import { Stroke, Point, Sheet } from '../types';
+
+import React, { useState, useEffect, useRef, useCallback, useLayoutEffect } from 'react';
+import { PenTool, Eraser, X, Loader2, List, ChevronRight, ChevronLeft, Hash, ArrowRight, ChevronDown, BookOpen, RotateCcw, Type, Square, Circle, Search, Check, ChevronUp, Type as TypeIcon } from 'lucide-react';
+import { Stroke, Point, Sheet, AnnotationType } from '../types';
 import { storage } from '../services/storage';
-import { PAGE_TURN_KEYS, COLORS } from '../constants';
+import { COLORS, PAGE_TURN_KEYS } from '../constants';
 import * as pdfjsLib from 'pdfjs-dist';
 
-// Handle ESM default export structure if present (fixes common issue with cdn imports of pdfjs)
+// Handle ESM default export wrapping from CDNs
 const pdfjs: any = (pdfjsLib as any).default || pdfjsLib;
+
+// Configure worker immediately
+if (pdfjs && pdfjs.GlobalWorkerOptions) {
+    pdfjs.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+}
+
+const FONTS = [
+    { label: 'Standard Sans', value: 'sans-serif' },
+    { label: 'Classic Serif', value: 'serif' },
+    { label: 'Typewriter Mono', value: 'monospace' },
+    { label: 'Handwritten', value: 'cursive' },
+    { label: 'Decorative', value: 'fantasy' },
+    { label: 'System Native', value: 'system-ui' }
+];
+
+const PRESET_FONT_SIZES = [12, 14, 16, 18, 20, 24, 28, 32, 40, 48, 64];
 
 interface ViewerProps {
   sheetId: string;
+  title: string;
   onClose: () => void;
   onNext: () => void;
   onPrev: () => void;
   hasNext: boolean;
   hasPrev: boolean;
-  title: string;
-  queue?: { id: string; name: string }[];
-  currentQueueIndex?: number;
-  onJumpTo?: (index: number) => void;
-  initialDirection?: 'forward' | 'backward';
+  queue: { id: string; name: string }[];
+  currentQueueIndex: number;
+  onJumpTo: (index: number) => void;
+  initialDirection: 'forward' | 'backward';
 }
 
-// Helper: Squared distance between two points
-const dist2 = (p1: Point, p2: Point) => (p1.x - p2.x) ** 2 + (p1.y - p2.y) ** 2;
-
-// Helper: Minimum squared distance from point P to segment AB
-const distToSegmentSquared = (p: Point, a: Point, b: Point) => {
-  const l2 = dist2(a, b);
-  if (l2 === 0) return dist2(p, a);
-  let t = ((p.x - a.x) * (b.x - a.x) + (p.y - a.y) * (b.y - a.y)) / l2;
-  t = Math.max(0, Math.min(1, t));
-  return dist2(p, { x: a.x + t * (b.x - a.x), y: a.y + t * (b.y - a.y) });
-};
-
-// Helper: Convert Hex to RGBA
-const hexToRgba = (hex: string, alpha: number) => {
-    let r = 0, g = 0, b = 0;
-    if (hex.length === 4) {
-      r = parseInt(hex[1] + hex[1], 16);
-      g = parseInt(hex[2] + hex[2], 16);
-      b = parseInt(hex[3] + hex[3], 16);
-    } else if (hex.length === 7) {
-      r = parseInt(hex.slice(1, 3), 16);
-      g = parseInt(hex.slice(3, 5), 16);
-      b = parseInt(hex.slice(5, 7), 16);
-    }
-    return `rgba(${r}, ${g}, ${b}, ${alpha})`;
-};
-
-const Viewer: React.FC<ViewerProps> = ({ 
-    sheetId, onClose, onNext, onPrev, hasNext, hasPrev, title,
-    queue, currentQueueIndex, onJumpTo, initialDirection = 'forward'
+const Viewer: React.FC<ViewerProps> = ({
+  sheetId,
+  title,
+  onClose,
+  onNext,
+  onPrev,
+  hasNext,
+  hasPrev,
+  queue,
+  currentQueueIndex,
+  onJumpTo,
+  initialDirection
 }) => {
   const [sheet, setSheet] = useState<Sheet | null>(null);
-  
-  // Navigation State
   const [activeFileIndex, setActiveFileIndex] = useState(0);
   const [subPageIndex, setSubPageIndex] = useState(0);
-  
-  // Current File Metadata
   const [numSubPages, setNumSubPages] = useState(0);
-  const [fileType, setFileType] = useState<string>('');
-
-  // UI States
-  const [showPageNav, setShowPageNav] = useState(false);
-  const [targetPage, setTargetPage] = useState(1);
-  const [showQueueMenu, setShowQueueMenu] = useState(false);
-
-  // Content Loading State
-  const [blobUrl, setBlobUrl] = useState<string | null>(null);
-  const [pdfDoc, setPdfDoc] = useState<any>(null); // PDFDocumentProxy
   const [loading, setLoading] = useState(true);
   
-  const loadDirection = useRef<'forward' | 'backward'>('forward');
-  
-  // Worker State
-  const [workerReady, setWorkerReady] = useState(false);
-  
   // Annotation State
-  const [isDrawingMode, setIsDrawingMode] = useState(false);
-  const [tool, setTool] = useState<'pen' | 'eraser'>('pen');
-  const [currentStroke, setCurrentStroke] = useState<Stroke | null>(null);
+  const [isAnnotating, setIsAnnotating] = useState(false);
+  const [currentTool, setCurrentTool] = useState<AnnotationType | 'eraser'>('path');
+  const [selectedColor, setSelectedColor] = useState(COLORS[0]);
+  const [selectedWidth, setSelectedWidth] = useState(4);
+  const [selectedFontSize, setSelectedFontSize] = useState(24);
+  const [selectedFont, setSelectedFont] = useState(FONTS[0].value);
   const [allStrokes, setAllStrokes] = useState<Stroke[]>([]);
-  const [color, setColor] = useState(COLORS[0]);
-  const [lineWidth, setLineWidth] = useState(3);
-  const [opacity, setOpacity] = useState(1);
-  const [showPenSettings, setShowPenSettings] = useState(false);
-  const [showColorPicker, setShowColorPicker] = useState(false);
-  const [dimensions, setDimensions] = useState({ width: 0, height: 0 });
+  const [activeStroke, setActiveStroke] = useState<Stroke | null>(null);
   
-  // Floating Toolbar State
-  const [toolbarPos, setToolbarPos] = useState({ x: 20, y: 100 });
-  
-  // Refs
-  const svgRef = useRef<SVGSVGElement>(null);
+  // Popover States
+  const [showFontPicker, setShowFontPicker] = useState(false);
+  const [showSizePicker, setShowSizePicker] = useState(false);
+  const [fontSearchQuery, setFontSearchQuery] = useState('');
+
+  // Inline Text Input State
+  const [textInput, setTextInput] = useState<{ x: number, y: number, w: number, h: number, value: string } | null>(null);
+
+  // UI State
+  const [showControls, setShowControls] = useState(true);
+  const [showQueue, setShowQueue] = useState(false);
+  const [showJumpDropdown, setShowJumpDropdown] = useState(false);
+  const [dimensions, setDimensions] = useState({ width: 1000, height: 1400 });
+  const [displayScale, setDisplayScale] = useState(1);
+
+  // Stability Refs
+  const pdfDocCache = useRef<Map<number, any>>(new Map());
+  const canvasCache = useRef<Map<string, HTMLCanvasElement>>(new Map());
+  const renderTasks = useRef<Map<string, any>>(new Map());
   const containerRef = useRef<HTMLDivElement>(null);
   const pdfCanvasRef = useRef<HTMLCanvasElement>(null);
-  const pageNavRef = useRef<HTMLDivElement>(null);
-  const queueMenuRef = useRef<HTMLDivElement>(null);
-  
-  // Toolbar Drag Refs
-  const isDraggingToolbar = useRef(false);
-  const dragStart = useRef({ x: 0, y: 0 });
-  const initialPos = useRef({ x: 0, y: 0 });
-  
-  // 0. Initialize Worker safely
-  useEffect(() => {
-    if (pdfjs.GlobalWorkerOptions.workerSrc) {
-        setWorkerReady(true);
-        return;
+  const imageRef = useRef<HTMLImageElement>(null);
+  const inlineTextRef = useRef<HTMLTextAreaElement>(null);
+  const fontSearchInputRef = useRef<HTMLInputElement>(null);
+
+  const currentViewRef = useRef<{ sheetId: string; fileIndex: number; pageIndex: number }>({
+    sheetId,
+    fileIndex: 0,
+    pageIndex: initialDirection === 'backward' ? -1 : 0
+  });
+
+  const currentFile = sheet?.pages?.[activeFileIndex];
+  const isPdf = currentFile?.fileType === 'application/pdf';
+  const totalDisplayPages = isPdf ? numSubPages : (sheet?.pages?.length || 0);
+  const currentDisplayPage = isPdf ? (Math.max(0, subPageIndex) + 1) : (activeFileIndex + 1);
+
+  const updateDisplayScale = useCallback(() => {
+    const element = isPdf ? pdfCanvasRef.current : imageRef.current;
+    if (element && dimensions.width > 0) {
+      const rect = element.getBoundingClientRect();
+      setDisplayScale(rect.width / dimensions.width);
     }
-    // Set worker directly to CDN to avoid blob/fetch issues
-    pdfjs.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
-    setWorkerReady(true);
-  }, []);
+  }, [isPdf, dimensions.width]);
 
-  // 1. Load Sheet Data & Annotations
-  useEffect(() => {
-    let active = true;
-    const loadSheet = async () => {
-      setLoading(true);
-      setPdfDoc(null);
-      
-      try {
-        const loadedSheet = await storage.getSheet(sheetId);
-        if (loadedSheet && active) {
-            setSheet(loadedSheet);
-            
-            if (initialDirection === 'backward') {
-                setActiveFileIndex(loadedSheet.pages.length - 1);
-                loadDirection.current = 'backward';
-            } else {
-                setActiveFileIndex(0);
-                setSubPageIndex(0);
-                loadDirection.current = 'forward';
-            }
+  useLayoutEffect(() => {
+    window.addEventListener('resize', updateDisplayScale);
+    return () => window.removeEventListener('resize', updateDisplayScale);
+  }, [updateDisplayScale]);
 
-            const storedAnnotations = await storage.getAnnotation(sheetId);
-            setAllStrokes(storedAnnotations ? storedAnnotations.strokes : []);
-        }
-      } catch (err) {
-        console.error("Error loading sheet:", err);
-        if (active) setLoading(false);
-      }
+  useLayoutEffect(() => {
+    setLoading(true);
+    setSheet(null);
+    setNumSubPages(0);
+    setActiveFileIndex(0);
+    setSubPageIndex(initialDirection === 'backward' ? -1 : 0);
+    
+    pdfDocCache.current.clear();
+    canvasCache.current.clear();
+    renderTasks.current.forEach(task => { try { task.cancel(); } catch(e) {} });
+    renderTasks.current.clear();
+    
+    const ctx = pdfCanvasRef.current?.getContext('2d');
+    if (ctx && pdfCanvasRef.current) {
+        ctx.clearRect(0, 0, pdfCanvasRef.current.width, pdfCanvasRef.current.height);
+    }
+
+    currentViewRef.current = {
+      sheetId,
+      fileIndex: 0,
+      pageIndex: initialDirection === 'backward' ? -1 : 0
     };
-    loadSheet();
-    return () => { active = false; };
   }, [sheetId, initialDirection]);
 
-  // 2. Load Content for Current File (Image or PDF)
   useEffect(() => {
-    if (!sheet || !sheet.pages || sheet.pages.length === 0) return;
+    let active = true;
+    const load = async () => {
+      try {
+        const loaded = await storage.getSheet(sheetId);
+        if (!active || sheetId !== currentViewRef.current.sheetId) return;
+
+        if (loaded) {
+          const targetFileIdx = initialDirection === 'backward' ? Math.max(0, loaded.pages.length - 1) : 0;
+          currentViewRef.current.fileIndex = targetFileIdx;
+          setActiveFileIndex(targetFileIdx);
+          setSheet(loaded);
+          
+          const annotations = await storage.getAnnotation(sheetId);
+          if (active && sheetId === currentViewRef.current.sheetId) {
+            setAllStrokes(annotations?.strokes || []);
+          }
+        } else {
+           onClose();
+        }
+      } catch (err) {
+        console.error("Load error", err);
+      }
+    };
+    load();
+    return () => { active = false; };
+  }, [sheetId, initialDirection, onClose]);
+
+  const getPdfDoc = useCallback(async (fileIdx: number) => {
+    if (!sheet || !sheet.pages || !sheet.pages[fileIdx]) return null;
+    if (pdfDocCache.current.has(fileIdx)) return pdfDocCache.current.get(fileIdx);
+    if (sheet.pages[fileIdx].fileType !== 'application/pdf') return null;
+
+    try {
+        const arrayBuffer = await sheet.pages[fileIdx].blob.arrayBuffer();
+        const doc = await pdfjs.getDocument({ data: new Uint8Array(arrayBuffer) }).promise;
+        if (sheetId === currentViewRef.current.sheetId) {
+            pdfDocCache.current.set(fileIdx, doc);
+            return doc;
+        }
+        return null;
+    } catch (e) {
+        return null;
+    }
+  }, [sheet, sheetId]);
+
+  const renderPage = useCallback(async (fIdx: number, pIdx: number, isPriority = false) => {
+    const key = `${sheetId}-${fIdx}-${pIdx}`;
     
-    if (activeFileIndex >= sheet.pages.length) {
-        setActiveFileIndex(0);
+    if (canvasCache.current.has(key)) {
+        if (isPriority) {
+            const cachedCanvas = canvasCache.current.get(key);
+            const mainCanvas = pdfCanvasRef.current;
+            if (mainCanvas && cachedCanvas) {
+                mainCanvas.width = cachedCanvas.width;
+                mainCanvas.height = cachedCanvas.height;
+                setDimensions({ width: cachedCanvas.width, height: cachedCanvas.height });
+                mainCanvas.getContext('2d')?.drawImage(cachedCanvas, 0, 0);
+                setTimeout(updateDisplayScale, 0);
+            }
+            setLoading(false);
+        }
         return;
     }
 
-    const currentPageData = sheet.pages[activeFileIndex];
-    const type = currentPageData.fileType;
-    setFileType(type);
-    
-    let active = true;
-    setLoading(true);
-    setBlobUrl(null);
-    setPdfDoc(null);
+    const doc = await getPdfDoc(fIdx);
+    if (!doc || sheetId !== currentViewRef.current.sheetId || fIdx !== currentViewRef.current.fileIndex) return;
 
-    const loadContent = async () => {
-        if (type === 'application/pdf') {
-             if (!workerReady) return; 
-             try {
-                const arrayBuffer = await currentPageData.blob.arrayBuffer();
-                if (!active) return;
-                
-                const loadingTask = pdfjs.getDocument({
-                    data: new Uint8Array(arrayBuffer),
-                    cMapUrl: 'https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/cmaps/',
-                    cMapPacked: true,
-                });
+    try {
+        const page = await doc.getPage(pIdx + 1);
+        const viewport = page.getViewport({ scale: 2 });
+        const offscreenCanvas = document.createElement('canvas');
+        offscreenCanvas.width = viewport.width;
+        offscreenCanvas.height = viewport.height;
+        
+        const task = page.render({
+            canvasContext: offscreenCanvas.getContext('2d')!,
+            viewport
+        });
 
-                const doc = await loadingTask.promise;
-                if (active) {
-                    setPdfDoc(doc);
-                    setNumSubPages(doc.numPages);
-                    if (loadDirection.current === 'backward') {
-                        setSubPageIndex(doc.numPages - 1);
-                    } else {
-                        setSubPageIndex(0);
-                    }
-                    setLoading(false);
+        renderTasks.current.set(key, task);
+        await task.promise;
+        
+        if (sheetId === currentViewRef.current.sheetId && fIdx === currentViewRef.current.fileIndex) {
+            canvasCache.current.set(key, offscreenCanvas);
+            if (isPriority && pIdx === currentViewRef.current.pageIndex) {
+                const mainCanvas = pdfCanvasRef.current;
+                if (mainCanvas) {
+                    mainCanvas.width = offscreenCanvas.width;
+                    mainCanvas.height = offscreenCanvas.height;
+                    setDimensions({ width: offscreenCanvas.width, height: offscreenCanvas.height });
+                    mainCanvas.getContext('2d')?.drawImage(offscreenCanvas, 0, 0);
+                    setTimeout(updateDisplayScale, 0);
                 }
-             } catch (e) {
-                 console.error("PDF Load Error", e);
-                 if (active) setLoading(false);
-             }
-        } else {
-            const url = URL.createObjectURL(currentPageData.blob);
-            if (active) {
-                setBlobUrl(url);
-                setNumSubPages(1);
-                setSubPageIndex(0);
                 setLoading(false);
             }
         }
-    };
+    } catch (e) {
+        if (isPriority) setLoading(false);
+    }
+  }, [sheetId, getPdfDoc, updateDisplayScale]);
 
-    loadContent();
-
-    return () => {
-        active = false;
-        if (blobUrl) URL.revokeObjectURL(blobUrl);
-    };
-  }, [sheet, activeFileIndex, workerReady]);
-
-  // 3. Render PDF Page
   useEffect(() => {
-    if (fileType !== 'application/pdf' || !pdfDoc || !pdfCanvasRef.current) return;
-    let renderTask: any = null;
-    const renderPage = async () => {
-        try {
-            const pageNumber = subPageIndex + 1;
-            const page = await pdfDoc.getPage(pageNumber);
-            const container = containerRef.current;
-            if (!container) return;
-            const { clientWidth, clientHeight } = container;
-            const unscaledViewport = page.getViewport({ scale: 1 });
-            const scaleX = clientWidth / unscaledViewport.width;
-            const scaleY = clientHeight / unscaledViewport.height;
-            const scale = Math.min(scaleX, scaleY) * 0.98;
-            const viewport = page.getViewport({ scale });
-            const canvas = pdfCanvasRef.current;
-            if (canvas) {
-                canvas.height = viewport.height;
-                canvas.width = viewport.width;
-                const renderContext = {
-                    canvasContext: canvas.getContext('2d')!,
-                    viewport: viewport,
-                };
-                renderTask = page.render(renderContext);
-                await renderTask.promise;
+    if (!sheet) return;
+    const currentFile = sheet.pages[activeFileIndex];
+    if (!currentFile) return;
+
+    if (currentFile.fileType === 'application/pdf') {
+        getPdfDoc(activeFileIndex).then(doc => {
+            if (!doc || sheetId !== currentViewRef.current.sheetId) return;
+            setNumSubPages(doc.numPages);
+            if (subPageIndex === -1) {
+                const last = doc.numPages - 1;
+                currentViewRef.current.pageIndex = last;
+                setSubPageIndex(last);
+            } else {
+                renderPage(activeFileIndex, subPageIndex, true);
             }
-        } catch (error: any) {
-            if (error.name !== 'RenderingCancelledException') {
-                console.error("PDF Render Error", error);
-            }
-        }
-    };
-    renderPage();
-    return () => { if (renderTask) renderTask.cancel(); };
-  }, [pdfDoc, subPageIndex, fileType, dimensions]);
-
-  // Sync dimensions
-  useEffect(() => {
-    const updateDimensions = () => {
-      if (containerRef.current) {
-        const { clientWidth, clientHeight } = containerRef.current;
-        setDimensions({ width: clientWidth, height: clientHeight });
-      }
-    };
-    updateDimensions();
-    const resizeObserver = new ResizeObserver(updateDimensions);
-    if (containerRef.current) resizeObserver.observe(containerRef.current);
-    return () => resizeObserver.disconnect();
-  }, [loading, blobUrl]);
-
-  // Save Annotations
-  useEffect(() => {
-    if (!loading && sheet) {
-      const timeout = setTimeout(() => {
-        storage.saveAnnotation(sheet.id, allStrokes);
-      }, 500); 
-      return () => clearTimeout(timeout);
-    }
-  }, [allStrokes, sheet, loading]);
-
-  // Click outside to close navs
-  useEffect(() => {
-    const handleClickOutside = (event: MouseEvent) => {
-      if (pageNavRef.current && !pageNavRef.current.contains(event.target as Node)) {
-        setShowPageNav(false);
-      }
-      if (queueMenuRef.current && !queueMenuRef.current.contains(event.target as Node)) {
-        setShowQueueMenu(false);
-      }
-      // Note: Pen Settings and Color Picker are now part of the floating toolbar structure,
-      // handling click outside for them is done slightly differently or they can stay open until toggled.
-      // For simplicity in the floating model, we'll let them toggle.
-    };
-    if (showPageNav || showQueueMenu) {
-      document.addEventListener('mousedown', handleClickOutside);
-    }
-    return () => document.removeEventListener('mousedown', handleClickOutside);
-  }, [showPageNav, showQueueMenu]);
-
-  // Navigation Handlers
-  const handlePageNext = () => {
-    if (subPageIndex < numSubPages - 1) {
-        setSubPageIndex(prev => prev + 1);
+        });
     } else {
-        if (sheet && activeFileIndex < sheet.pages.length - 1) {
-            loadDirection.current = 'forward';
-            setActiveFileIndex(prev => prev + 1);
-        } else if (hasNext) {
-            onNext();
-        }
+        setNumSubPages(1);
+        setSubPageIndex(0);
+        currentViewRef.current.pageIndex = 0;
+        setLoading(false);
     }
-  };
+  }, [sheet, activeFileIndex, subPageIndex, sheetId, getPdfDoc, renderPage]);
 
-  const handlePagePrev = () => {
-    if (subPageIndex > 0) {
-        setSubPageIndex(prev => prev - 1);
-    } else {
-        if (activeFileIndex > 0) {
-            loadDirection.current = 'backward';
-            setActiveFileIndex(prev => prev - 1);
-        } else if (hasPrev) {
-            onPrev();
-        }
+  const handlePointerDown = (e: React.PointerEvent) => {
+    if (!isAnnotating) return;
+    if (textInput) {
+        handleFinishText();
+        return;
     }
-  };
-
-  const handleJumpToPage = (e: React.FormEvent) => {
-      e.preventDefault();
-      const p = Math.max(1, Math.min(numSubPages, targetPage));
-      setSubPageIndex(p - 1);
-      setShowPageNav(false);
-  };
-
-  useEffect(() => {
-    const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
-      if (PAGE_TURN_KEYS.NEXT.includes(e.key)) {
-        e.preventDefault();
-        handlePageNext();
-      } else if (PAGE_TURN_KEYS.PREV.includes(e.key)) {
-        e.preventDefault();
-        handlePagePrev();
-      } else if (e.key === 'Escape') onClose();
-    };
-    window.addEventListener('keydown', handleKeyDown);
-    return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [handlePageNext, handlePagePrev, onClose]);
-
-  // --- Drawing Logic ---
-  
-  const getPoint = (e: React.MouseEvent | React.TouchEvent): Point | null => {
-    const container = containerRef.current;
-    if (!container) return null;
-    const rect = container.getBoundingClientRect();
-    let clientX, clientY;
-    if ('touches' in e && e.touches.length > 0) {
-        clientX = e.touches[0].clientX;
-        clientY = e.touches[0].clientY;
-    } else if ('changedTouches' in e && e.changedTouches.length > 0) {
-        clientX = e.changedTouches[0].clientX;
-        clientY = e.changedTouches[0].clientY;
-    } else if ('clientX' in e) {
-        clientX = (e as React.MouseEvent).clientX;
-        clientY = (e as React.MouseEvent).clientY;
-    } else {
-        return null;
+    
+    if (showFontPicker || showSizePicker) {
+        setShowFontPicker(false);
+        setShowSizePicker(false);
+        return;
     }
-    return { x: clientX - rect.left, y: clientY - rect.top };
-  };
 
-  const isStrokeOnCurrentPage = (stroke: Stroke) => {
-      let strokeFileIndex = stroke.fileIndex;
-      let strokePageIndex = stroke.pageIndex;
-      if (strokeFileIndex === undefined) {
-          const isSinglePdf = sheet?.pages.length === 1 && sheet.pages[0].fileType === 'application/pdf';
-          if (isSinglePdf) {
-              strokeFileIndex = 0;
-          } else {
-              strokeFileIndex = stroke.pageIndex;
-              strokePageIndex = 0;
-          }
-      }
-      return strokeFileIndex === activeFileIndex && strokePageIndex === subPageIndex;
-  };
+    e.stopPropagation();
 
-  const eraseAt = (point: Point) => {
-    const threshold = 200;
-    setAllStrokes(prev => prev.filter(stroke => {
-      if (!isStrokeOnCurrentPage(stroke)) return true;
-      for (let i = 0; i < stroke.points.length - 1; i++) {
-        if (distToSegmentSquared(point, stroke.points[i], stroke.points[i + 1]) < threshold) {
-          return false;
-        }
-      }
-      return true;
-    }));
-  };
+    const rect = e.currentTarget.getBoundingClientRect();
+    const x = (e.clientX - rect.left) / rect.width;
+    const y = (e.clientY - rect.top) / rect.height;
 
-  const handlePointerDown = (e: React.MouseEvent | React.TouchEvent) => {
-    if (!isDrawingMode) return;
-    const point = getPoint(e);
-    if (!point) return;
-
-    if (tool === 'eraser') {
-      eraseAt(point);
-    } else {
-      setCurrentStroke({
-        points: [point],
-        color: hexToRgba(color, opacity),
-        width: lineWidth,
-        pageIndex: subPageIndex,
-        fileIndex: activeFileIndex
+    if (currentTool === 'eraser') {
+      const newStrokes = allStrokes.filter(s => {
+        if (s.fileIndex !== activeFileIndex || s.pageIndex !== subPageIndex) return true;
+        return !s.points.some(p => Math.sqrt(Math.pow(p.x - x, 2) + Math.pow(p.y - y, 2)) < 0.012);
       });
+      setAllStrokes(newStrokes);
+      storage.saveAnnotation(sheetId, newStrokes);
+      return;
     }
+
+    const newStroke: Stroke = {
+      id: crypto.randomUUID(),
+      type: currentTool as AnnotationType,
+      points: [{ x, y }],
+      color: selectedColor,
+      width: currentTool === 'text' ? selectedFontSize : selectedWidth,
+      fontFamily: selectedFont,
+      fileIndex: activeFileIndex,
+      pageIndex: subPageIndex
+    };
+    setActiveStroke(newStroke);
   };
 
-  const handlePointerMove = (e: React.MouseEvent | React.TouchEvent) => {
-    if (!isDrawingMode) return;
-    if (!currentStroke && tool !== 'eraser') return;
-    if (tool === 'eraser' && !('touches' in e) && e.buttons !== 1) return;
+  const handlePointerMove = (e: React.PointerEvent) => {
+    if (!isAnnotating || !activeStroke) return;
+    const rect = e.currentTarget.getBoundingClientRect();
+    const x = (e.clientX - rect.left) / rect.width;
+    const y = (e.clientY - rect.top) / rect.height;
 
-    e.preventDefault(); 
-    const point = getPoint(e);
-    if (!point) return;
-
-    if (tool === 'eraser') {
-      eraseAt(point);
-    } else if (currentStroke) {
-      setCurrentStroke(prev => prev ? { ...prev, points: [...prev.points, point] } : null);
+    if (activeStroke.type === 'path') {
+        setActiveStroke(prev => prev ? { ...prev, points: [...prev.points, { x, y }] } : null);
+    } else {
+        setActiveStroke(prev => prev ? { ...prev, points: [prev.points[0], { x, y }] } : null);
     }
   };
 
   const handlePointerUp = () => {
-    if (currentStroke) {
-      setAllStrokes(prev => [...prev, currentStroke]);
-      setCurrentStroke(null);
+    if (!activeStroke) return;
+
+    if (activeStroke.type === 'text') {
+        const p0 = activeStroke.points[0];
+        const p1 = activeStroke.points[activeStroke.points.length - 1];
+        
+        const x = Math.min(p0.x, p1.x);
+        const y = Math.min(p0.y, p1.y);
+        const w = Math.max(0.02, Math.abs(p1.x - p0.x));
+        const h = Math.max(0.015, Math.abs(p1.y - p0.y));
+
+        updateDisplayScale();
+        setTextInput({ x, y, w, h, value: '' });
+        setActiveStroke(null);
+    } else {
+        const updated = [...allStrokes, activeStroke];
+        setAllStrokes(updated);
+        storage.saveAnnotation(sheetId, updated);
+        setActiveStroke(null);
     }
   };
 
-  const handleUndo = () => {
-    const currentStrokes = allStrokes.filter(s => isStrokeOnCurrentPage(s));
-    const otherStrokes = allStrokes.filter(s => !isStrokeOnCurrentPage(s));
-    if (currentStrokes.length > 0) {
-        setAllStrokes([...otherStrokes, ...currentStrokes.slice(0, -1)]);
+  const handleFinishText = () => {
+    if (textInput && textInput.value.trim()) {
+        const newTextAnnotation: Stroke = {
+            id: crypto.randomUUID(),
+            type: 'text',
+            points: [
+                { x: textInput.x, y: textInput.y },
+                { x: textInput.x + textInput.w, y: textInput.y + textInput.h }
+            ],
+            color: selectedColor,
+            width: selectedFontSize,
+            fontFamily: selectedFont,
+            text: textInput.value,
+            fileIndex: activeFileIndex,
+            pageIndex: subPageIndex
+        };
+        const updated = [...allStrokes, newTextAnnotation];
+        setAllStrokes(updated);
+        storage.saveAnnotation(sheetId, updated);
     }
+    setTextInput(null);
   };
 
-  const handleClear = () => {
-    if (confirm('Clear annotations on this page?')) {
-        setAllStrokes(prev => prev.filter(s => !isStrokeOnCurrentPage(s)));
+  const turnPage = useCallback((dir: 1 | -1) => {
+    if (isPdf && dir === 1 && subPageIndex < numSubPages - 1) {
+        setSubPageIndex(prev => prev + 1);
+        currentViewRef.current.pageIndex++;
+    } else if (isPdf && dir === -1 && subPageIndex > 0) {
+        setSubPageIndex(prev => prev - 1);
+        currentViewRef.current.pageIndex--;
+    } else if (dir === 1 && sheet && activeFileIndex < sheet.pages.length - 1) {
+        setActiveFileIndex(prev => prev + 1);
+        setSubPageIndex(0);
+        currentViewRef.current.fileIndex++;
+        currentViewRef.current.pageIndex = 0;
+    } else if (dir === -1 && activeFileIndex > 0) {
+        setActiveFileIndex(prev => prev - 1);
+        setSubPageIndex(-1);
+        currentViewRef.current.fileIndex--;
+        currentViewRef.current.pageIndex = -1;
+    } else if (dir === 1 && hasNext) {
+        onNext();
+    } else if (dir === -1 && hasPrev) {
+        onPrev();
     }
+  }, [isPdf, subPageIndex, numSubPages, sheet, activeFileIndex, hasNext, hasPrev, onNext, onPrev]);
+
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (textInput) {
+          if (e.key === 'Enter' && !e.shiftKey) {
+              e.preventDefault();
+              handleFinishText();
+          }
+          if (e.key === 'Escape') {
+              setTextInput(null);
+          }
+          return;
+      }
+      if (PAGE_TURN_KEYS.NEXT.includes(e.key)) turnPage(1);
+      else if (PAGE_TURN_KEYS.PREV.includes(e.key)) turnPage(-1);
+      else if (e.key === 'Escape') {
+          if (showJumpDropdown) setShowJumpDropdown(false);
+          else if (showQueue) setShowQueue(false);
+          else if (showFontPicker || showSizePicker) {
+              setShowFontPicker(false);
+              setShowSizePicker(false);
+          }
+          else onClose();
+      }
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [turnPage, onClose, showJumpDropdown, showQueue, textInput, showFontPicker, showSizePicker]);
+
+  const handleContainerClick = (e: React.MouseEvent) => {
+    if (isAnnotating || showJumpDropdown || showQueue || textInput || showFontPicker || showSizePicker) {
+        if (showJumpDropdown) setShowJumpDropdown(false);
+        if (showQueue) setShowQueue(false);
+        if (showFontPicker) setShowFontPicker(false);
+        if (showSizePicker) setShowSizePicker(false);
+        return;
+    }
+    const x = e.clientX / window.innerWidth;
+    if (x < 0.2) turnPage(-1);
+    else if (x > 0.8) turnPage(1);
+    else setShowControls(!showControls);
   };
 
-  // --- Toolbar Drag Logic ---
+  const filteredFonts = FONTS.filter(f => 
+    f.label.toLowerCase().includes(fontSearchQuery.toLowerCase())
+  );
 
-  const onToolbarPointerDown = (e: React.PointerEvent) => {
-    e.preventDefault();
-    e.stopPropagation();
-    const target = e.currentTarget as HTMLElement;
-    target.setPointerCapture(e.pointerId);
-    isDraggingToolbar.current = true;
-    dragStart.current = { x: e.clientX, y: e.clientY };
-    initialPos.current = { ...toolbarPos };
+  const renderAnnotation = (anno: Stroke, key: string | number, isGhost = false) => {
+      const { type = 'path', points, color, width, text, fontFamily } = anno;
+      if (points.length === 0) return null;
+
+      const p0 = points[0];
+      const p1 = points[points.length - 1];
+
+      const x0 = p0.x * dimensions.width;
+      const y0 = p0.y * dimensions.height;
+      const x1 = p1.x * dimensions.width;
+      const y1 = p1.y * dimensions.height;
+
+      const strokeProps = {
+          key,
+          stroke: color,
+          strokeWidth: width,
+          fill: 'none',
+          strokeLinecap: 'round' as const,
+          strokeLinejoin: 'round' as const,
+          className: isGhost ? 'opacity-50' : ''
+      };
+
+      if (isGhost && type === 'text') {
+        return (
+            <rect 
+                key={key}
+                x={Math.min(x0, x1)}
+                y={Math.min(y0, y1)}
+                width={Math.max(2, Math.abs(x1 - x0))}
+                height={Math.max(2, Math.abs(y1 - y0))}
+                stroke={color}
+                strokeWidth={1.5}
+                fill={`${color}22`}
+                strokeDasharray="4,4"
+                className="opacity-60"
+            />
+        );
+      }
+
+      switch (type) {
+          case 'path':
+              return (
+                  <path 
+                    {...strokeProps}
+                    d={points.map((p, j) => `${j === 0 ? 'M' : 'L'} ${p.x * dimensions.width} ${p.y * dimensions.height}`).join(' ')}
+                  />
+              );
+          case 'rect':
+              return (
+                  <rect 
+                    {...strokeProps}
+                    x={Math.min(x0, x1)}
+                    y={Math.min(y0, y1)}
+                    width={Math.abs(x1 - x0)}
+                    height={Math.abs(y1 - y0)}
+                  />
+              );
+          case 'circle':
+              const rx = Math.abs(x1 - x0) / 2;
+              const ry = Math.abs(y1 - y0) / 2;
+              return (
+                  <ellipse 
+                    {...strokeProps}
+                    cx={Math.min(x0, x1) + rx}
+                    cy={Math.min(y0, y1) + ry}
+                    rx={rx}
+                    ry={ry}
+                  />
+              );
+          case 'text':
+              const fs = width; // For text, width is the font size
+              return (
+                  <text 
+                    key={key}
+                    x={Math.min(x0, x1)}
+                    y={Math.min(y0, y1) + (fs * 0.8)}
+                    fill={color}
+                    fontSize={fs}
+                    fontFamily={fontFamily || 'sans-serif'}
+                    fontWeight="bold"
+                    className={isGhost ? 'opacity-30' : ''}
+                  >
+                      {text}
+                  </text>
+              );
+          default:
+              return null;
+      }
   };
-
-  const onToolbarPointerMove = (e: React.PointerEvent) => {
-    if (!isDraggingToolbar.current) return;
-    e.preventDefault();
-    e.stopPropagation();
-    const dx = e.clientX - dragStart.current.x;
-    const dy = e.clientY - dragStart.current.y;
-    // Basic bounds
-    const newX = initialPos.current.x + dx;
-    const newY = initialPos.current.y + dy;
-    setToolbarPos({ x: newX, y: newY });
-  };
-
-  const onToolbarPointerUp = (e: React.PointerEvent) => {
-    isDraggingToolbar.current = false;
-    const target = e.currentTarget as HTMLElement;
-    target.releasePointerCapture(e.pointerId);
-  };
-
-  const getSvgPath = (points: Point[]) => {
-    if (points.length === 0) return '';
-    return points.map((p, i) => `${i === 0 ? 'M' : 'L'} ${p.x} ${p.y}`).join(' ');
-  };
-
-  const visibleStrokes = allStrokes.filter(s => isStrokeOnCurrentPage(s));
-  const popoverSideClass = toolbarPos.x > (window.innerWidth / 2) ? 'right-full mr-2' : 'left-full ml-2';
 
   return (
-    <div className="fixed inset-0 z-50 bg-black flex flex-col h-screen w-screen">
-      {/* Top Bar */}
-      <div className={`absolute top-0 left-0 right-0 z-20 flex justify-between items-center p-4 bg-gradient-to-b from-black/80 to-transparent transition-opacity duration-300 ${(isDrawingMode || showPageNav || showPenSettings || showQueueMenu) ? 'opacity-100' : 'opacity-0 hover:opacity-100'}`}>
-        <div className="flex items-center gap-4">
-            <button onClick={onClose} className="p-2 rounded-full bg-white/10 hover:bg-white/20 backdrop-blur text-white">
-                <X size={20} />
-            </button>
-            <div className="flex flex-col">
-                <div className="flex items-center gap-2">
-                    <h2 className="text-white font-medium truncate max-w-[200px] sm:max-w-md shadow-sm">{title}</h2>
-                    {sheet && sheet.pages.length > 1 && (
-                        <div className="flex items-center gap-1 bg-white/10 px-2 py-0.5 rounded text-[10px] text-slate-300">
-                             <FileText size={10} />
-                             <span>File {activeFileIndex + 1}/{sheet.pages.length}</span>
-                        </div>
-                    )}
-                    
-                    {queue && queue.length > 1 && (
-                        <div className="relative" ref={queueMenuRef}>
-                            <button
-                                onClick={() => {
-                                    setShowQueueMenu(!showQueueMenu);
-                                    setShowPageNav(false);
-                                    setShowPenSettings(false);
-                                }}
-                                className={`p-1.5 rounded-full transition-colors ${showQueueMenu ? 'bg-white/20 text-white' : 'text-slate-300 hover:text-white hover:bg-white/10'}`}
-                                title="Setlist Queue"
-                            >
-                                <List size={18} />
-                            </button>
-                            {showQueueMenu && (
-                                <div className="absolute top-full left-0 mt-2 bg-slate-800 border border-slate-700 rounded-xl shadow-2xl w-72 max-h-[60vh] overflow-y-auto z-50 flex flex-col py-1">
-                                    {queue.map((item, idx) => (
-                                        <button
-                                            key={`${item.id}-${idx}`}
-                                            onClick={() => {
-                                                onJumpTo?.(idx);
-                                                setShowQueueMenu(false);
-                                            }}
-                                            className={`text-left px-4 py-3 text-sm border-b border-slate-700/50 last:border-0 hover:bg-slate-700 transition-colors ${idx === currentQueueIndex ? 'bg-blue-600/20 text-blue-300 font-medium border-l-2 border-l-blue-500' : 'text-slate-300'}`}
+    <div className="fixed inset-0 bg-slate-950 flex flex-col z-50 overflow-hidden touch-none select-none">
+      {/* HUD Top */}
+      <div className={`absolute top-0 left-0 right-0 p-4 bg-gradient-to-b from-black/80 to-transparent z-50 flex items-center justify-between transition-opacity duration-200 ${showControls || isAnnotating ? 'opacity-100' : 'opacity-0'}`}>
+        <div className="flex items-center gap-3">
+             <button onClick={onClose} className="p-2.5 bg-white/10 hover:bg-white/20 rounded-full text-white backdrop-blur-md transition-all"><X size={20} /></button>
+             <div className="text-white relative">
+                <h2 className="font-bold text-lg truncate max-w-[150px] sm:max-w-md">{title}</h2>
+                <button 
+                  onClick={(e) => { e.stopPropagation(); if (!loading) setShowJumpDropdown(!showJumpDropdown); }}
+                  className={`flex items-center gap-2 text-[10px] font-black uppercase tracking-widest transition-colors ${loading ? 'text-slate-600 cursor-wait' : 'text-slate-400 hover:text-blue-400'}`}
+                >
+                    {loading ? <span>Syncing...</span> : <span className="bg-white/5 px-2 py-1 rounded flex items-center gap-1.5">{currentDisplayPage} / {totalDisplayPages} <ChevronDown size={10}/></span>}
+                </button>
+             </div>
+        </div>
+        <div className="flex items-center gap-2">
+             <button onClick={() => { setIsAnnotating(!isAnnotating); if (!isAnnotating && currentTool === 'eraser') setCurrentTool('path'); }} className={`p-3 rounded-xl transition-all ${isAnnotating && currentTool !== 'eraser' ? 'bg-blue-600 text-white shadow-lg' : 'bg-white/10 text-white'}`}><PenTool size={20} /></button>
+             <button onClick={() => { setCurrentTool('eraser'); setIsAnnotating(true); }} className={`p-3 rounded-xl transition-all ${isAnnotating && currentTool === 'eraser' ? 'bg-blue-600 text-white shadow-lg' : 'bg-white/10 text-white'}`}><Eraser size={20} /></button>
+             <button onClick={(e) => { e.stopPropagation(); setShowQueue(!showQueue); }} className={`p-3 rounded-xl transition-colors ${showQueue ? 'bg-blue-600 text-white' : 'bg-white/10 text-white'}`}><List size={20} /></button>
+        </div>
+      </div>
+
+      <div ref={containerRef} className={`flex-1 relative flex items-center justify-center bg-zinc-950 ${isAnnotating ? 'cursor-crosshair' : 'cursor-default'}`} onClick={handleContainerClick} onPointerDown={handlePointerDown} onPointerMove={handlePointerMove} onPointerUp={handlePointerUp}>
+        {loading && (
+            <div className="absolute inset-0 flex flex-col items-center justify-center bg-zinc-950 z-40">
+                <Loader2 className="animate-spin text-blue-500 mb-4" size={48} />
+                <p className="text-slate-500 text-xs font-black uppercase tracking-widest">Loading...</p>
+            </div>
+        )}
+        <canvas ref={pdfCanvasRef} className={`max-w-full max-h-full object-contain shadow-2xl transition-opacity duration-300 pointer-events-none ${isPdf ? 'block' : 'hidden'}`} style={{ opacity: loading ? 0 : 1 }} />
+        {!loading && sheet && currentFile && !isPdf && (
+            <img ref={imageRef} src={URL.createObjectURL(currentFile.blob)} className="max-w-full max-h-full object-contain shadow-2xl pointer-events-none" alt="Sheet Page" onLoad={() => { setTimeout(updateDisplayScale, 100); }} />
+        )}
+        {!loading && sheet && (
+            <svg className="absolute inset-0 w-full h-full pointer-events-none z-10" viewBox={`0 0 ${dimensions.width} ${dimensions.height}`} preserveAspectRatio="none">
+                {allStrokes.filter(s => s.fileIndex === activeFileIndex && s.pageIndex === subPageIndex).map((stroke, i) => renderAnnotation(stroke, i))}
+                {activeStroke && renderAnnotation(activeStroke, 'active', true)}
+            </svg>
+        )}
+        {textInput && (
+            <div className="absolute z-50 flex items-center pointer-events-auto" style={{ left: `${textInput.x * 100}%`, top: `${textInput.y * 100}%`, width: `${textInput.w * 100}%`, height: `${textInput.h * 100}%` }}>
+                <textarea 
+                    ref={inlineTextRef}
+                    value={textInput.value}
+                    onChange={e => setTextInput({ ...textInput, value: e.target.value })}
+                    onBlur={handleFinishText}
+                    autoFocus
+                    className="w-full h-full bg-slate-900/90 border-2 border-blue-500 rounded px-2 py-1 text-white font-bold outline-none shadow-2xl resize-none overflow-hidden"
+                    style={{ color: selectedColor, fontSize: `${selectedFontSize * displayScale}px`, fontFamily: selectedFont, lineHeight: '1.2' }}
+                />
+            </div>
+        )}
+      </div>
+
+      {/* Floating Toolbar */}
+      {isAnnotating && (
+          <div className="absolute bottom-[max(4rem,calc(env(safe-area-inset-bottom)+1.5rem))] left-1/2 -translate-x-1/2 bg-slate-900/95 backdrop-blur-2xl border border-white/10 p-4 rounded-[3rem] shadow-[0_25px_60px_rgba(0,0,0,0.6)] flex items-center gap-4 z-[60] animate-in slide-in-from-bottom-8 duration-300 max-w-[98vw]">
+              
+              <div className="flex items-center bg-black/40 rounded-full p-1.5 shrink-0">
+                  <button onClick={() => { setCurrentTool('path'); setShowSizePicker(false); setShowFontPicker(false); }} className={`p-2.5 rounded-full transition-all ${currentTool === 'path' ? 'bg-blue-600 text-white shadow-lg scale-110' : 'text-slate-500 hover:text-slate-300'}`}><PenTool size={18} /></button>
+                  <button onClick={() => { setCurrentTool('text'); setShowSizePicker(false); setShowFontPicker(false); }} className={`p-2.5 rounded-full transition-all ${currentTool === 'text' ? 'bg-blue-600 text-white shadow-lg scale-110' : 'text-slate-500 hover:text-slate-300'}`}><Type size={18} /></button>
+                  <button onClick={() => { setCurrentTool('rect'); setShowSizePicker(false); setShowFontPicker(false); }} className={`p-2.5 rounded-full transition-all ${currentTool === 'rect' ? 'bg-blue-600 text-white shadow-lg scale-110' : 'text-slate-500 hover:text-slate-300'}`}><Square size={18} /></button>
+                  <button onClick={() => { setCurrentTool('circle'); setShowSizePicker(false); setShowFontPicker(false); }} className={`p-2.5 rounded-full transition-all ${currentTool === 'circle' ? 'bg-blue-600 text-white shadow-lg scale-110' : 'text-slate-500 hover:text-slate-300'}`}><Circle size={18} /></button>
+              </div>
+
+              <div className="w-px h-8 bg-white/10 shrink-0" />
+              
+              <div className="flex items-center gap-2 shrink-0">
+                  {COLORS.map(c => (
+                      <button key={c} onClick={() => { setSelectedColor(c); if (currentTool === 'eraser') setCurrentTool('path'); }} className={`w-7 h-7 rounded-full border-2 transition-all ${selectedColor === c && currentTool !== 'eraser' ? 'scale-110 border-white shadow-xl' : 'border-transparent opacity-60'}`} style={{ backgroundColor: c }} />
+                  ))}
+              </div>
+
+              <div className="w-px h-8 bg-white/10 shrink-0" />
+
+              {currentTool !== 'text' ? (
+                <div className="flex items-center gap-2 shrink-0 px-1">
+                    {[2, 4, 8].map(w => (
+                        <button key={w} onClick={() => { setSelectedWidth(w); if (currentTool === 'eraser') setCurrentTool('path'); }} className={`flex items-center justify-center transition-all ${selectedWidth === w && currentTool !== 'eraser' ? 'text-blue-400 scale-125' : 'text-slate-500'}`}>
+                            <div className="rounded-full bg-current" style={{ width: Math.max(5, w + 3), height: Math.max(5, w + 3) }} />
+                        </button>
+                    ))}
+                </div>
+              ) : (
+                <div className="flex items-center gap-3 shrink-0">
+                    {/* Font Size Selector */}
+                    <div className="relative overflow-visible">
+                        <button 
+                            onClick={(e) => { e.stopPropagation(); setShowSizePicker(!showSizePicker); setShowFontPicker(false); }}
+                            className={`flex items-center gap-2 px-3 py-2 rounded-full border transition-all ${showSizePicker ? 'bg-blue-600 text-white border-blue-500 shadow-lg' : 'bg-black/40 text-slate-400 border-white/10'}`}
+                        >
+                            <span className="text-[11px] font-black">{selectedFontSize}px</span>
+                            {showSizePicker ? <ChevronUp size={14} /> : <ChevronDown size={14} />}
+                        </button>
+
+                        {showSizePicker && (
+                            <div className="absolute bottom-[calc(100%+1.5rem)] left-0 w-32 bg-slate-900/98 backdrop-blur-3xl border border-white/10 rounded-3xl shadow-[0_25px_50px_-12px_rgba(0,0,0,0.9)] overflow-hidden z-[100]" onClick={e => e.stopPropagation()}>
+                                <div className="p-2 border-b border-white/5 flex items-center">
+                                    <input 
+                                        type="number" 
+                                        className="w-full bg-black/40 border border-white/10 rounded-xl px-2 py-2 text-xs text-white text-center outline-none focus:ring-1 focus:ring-blue-500"
+                                        value={selectedFontSize}
+                                        onChange={e => setSelectedFontSize(Math.max(1, parseInt(e.target.value) || 0))}
+                                        placeholder="Size"
+                                    />
+                                </div>
+                                <div className="max-h-48 overflow-y-auto py-2 no-scrollbar">
+                                    {PRESET_FONT_SIZES.map(sz => (
+                                        <button 
+                                            key={sz}
+                                            onClick={() => { setSelectedFontSize(sz); setShowSizePicker(false); }}
+                                            className={`w-full flex items-center justify-center py-2.5 hover:bg-white/10 transition-colors ${selectedFontSize === sz ? 'text-blue-400' : 'text-slate-300'}`}
                                         >
-                                            <div className="flex gap-3">
-                                                <span className="opacity-50 w-5 text-right font-mono">{idx + 1}.</span>
-                                                <span className="truncate">{item.name}</span>
-                                            </div>
+                                            <span className="text-xs font-bold">{sz}px</span>
                                         </button>
                                     ))}
                                 </div>
-                            )}
-                        </div>
-                    )}
-                </div>
-
-                {numSubPages > 1 && (
-                    <div className="relative" ref={pageNavRef}>
-                        <button 
-                            onClick={() => {
-                                setShowPageNav(!showPageNav);
-                                setTargetPage(subPageIndex + 1);
-                                setShowPenSettings(false); 
-                                setShowQueueMenu(false);
-                            }}
-                            className="flex items-center gap-1 text-xs text-slate-300 hover:text-white bg-white/5 px-2 py-1 rounded transition-colors mt-0.5"
-                        >
-                            <span>Page {subPageIndex + 1} / {numSubPages}</span>
-                            <ChevronDown size={12} className={`transition-transform ${showPageNav ? 'rotate-180' : ''}`} />
-                        </button>
-
-                        {showPageNav && (
-                            <div className="absolute top-full left-0 mt-2 bg-slate-800 border border-slate-700 rounded-xl p-4 shadow-2xl w-64 z-50">
-                                <form onSubmit={handleJumpToPage} className="flex flex-col gap-4">
-                                    <div className="flex items-center justify-between gap-2">
-                                        <span className="text-xs text-slate-400 font-bold uppercase">Go to page</span>
-                                        <span className="text-xs text-slate-500">{targetPage} / {numSubPages}</span>
-                                    </div>
-                                    
-                                    <input 
-                                        type="range" 
-                                        min="1" 
-                                        max={numSubPages} 
-                                        value={targetPage}
-                                        onChange={(e) => setTargetPage(parseInt(e.target.value))}
-                                        className="w-full h-2 bg-slate-700 rounded-lg appearance-none cursor-pointer accent-blue-500"
-                                    />
-
-                                    <div className="flex gap-2">
-                                        <input 
-                                            type="number" 
-                                            min="1" 
-                                            max={numSubPages}
-                                            value={targetPage}
-                                            onChange={(e) => setTargetPage(parseInt(e.target.value))}
-                                            className="flex-1 bg-slate-900 border border-slate-700 rounded px-2 py-1 text-sm text-center focus:ring-1 focus:ring-blue-500 outline-none"
-                                        />
-                                        <button 
-                                            type="submit"
-                                            className="bg-blue-600 hover:bg-blue-500 text-white px-3 py-1 rounded text-sm font-medium"
-                                        >
-                                            Go
-                                        </button>
-                                    </div>
-                                </form>
                             </div>
                         )}
                     </div>
-                )}
-            </div>
-        </div>
 
-        <div className="flex items-center gap-2 bg-slate-800/90 backdrop-blur rounded-full px-3 py-1.5 border border-white/10">
-             <button 
-                onClick={() => setIsDrawingMode(!isDrawingMode)} 
-                className={`p-2 rounded-full transition-colors ${isDrawingMode ? 'bg-blue-600 text-white' : 'text-slate-400 hover:text-white'}`}
-                title={isDrawingMode ? "Done Drawing" : "Annotate"}
-             >
-                <PenTool size={18} />
-             </button>
-        </div>
-      </div>
+                    {/* Font Family Selector */}
+                    <div className="relative overflow-visible">
+                        <button 
+                            onClick={(e) => { e.stopPropagation(); setShowFontPicker(!showFontPicker); setShowSizePicker(false); }}
+                            className={`flex items-center gap-2.5 px-4 py-2.5 rounded-full border transition-all ${showFontPicker ? 'bg-blue-600 text-white border-blue-500 shadow-lg' : 'bg-black/40 text-slate-400 border-white/10'}`}
+                        >
+                            <span className="text-[10px] font-black uppercase tracking-wider truncate max-w-[70px]" style={{ fontFamily: selectedFont }}>
+                                {FONTS.find(f => f.value === selectedFont)?.label || 'Font'}
+                            </span>
+                            {showFontPicker ? <ChevronUp size={14} /> : <ChevronDown size={14} />}
+                        </button>
 
-      {/* Floating Vertical Annotation Toolbar */}
-      {isDrawingMode && (
-         <div 
-            style={{ transform: `translate(${toolbarPos.x}px, ${toolbarPos.y}px)` }} 
-            className="fixed z-50 top-0 left-0 flex flex-col items-center gap-2 p-2 bg-slate-800/90 backdrop-blur rounded-full border border-white/10 shadow-2xl touch-none"
-         >
-             {/* Handle */}
-             <div 
-                className="flex items-center justify-center p-2 text-slate-400 cursor-grab active:cursor-grabbing hover:text-white"
-                onPointerDown={onToolbarPointerDown}
-                onPointerMove={onToolbarPointerMove}
-                onPointerUp={onToolbarPointerUp}
-             >
-                <GripHorizontal size={20} />
-             </div>
-
-             <div className="w-8 h-px bg-white/10 my-1" />
-
-             {/* Tools */}
-             <button 
-                onClick={() => setTool('pen')}
-                className={`p-3 rounded-full transition-colors ${tool === 'pen' ? 'bg-blue-600 text-white' : 'text-slate-400 hover:text-white hover:bg-white/10'}`}
-             >
-                <PenTool size={18} />
-             </button>
-             <button 
-                onClick={() => setTool('eraser')}
-                className={`p-3 rounded-full transition-colors ${tool === 'eraser' ? 'bg-blue-600 text-white' : 'text-slate-400 hover:text-white hover:bg-white/10'}`}
-             >
-                <Eraser size={18} />
-             </button>
-
-             {/* Color Picker Toggle */}
-             {tool === 'pen' && (
-                 <div className="relative">
-                    <button 
-                        onClick={() => {
-                            setShowColorPicker(!showColorPicker);
-                            setShowPenSettings(false);
-                        }}
-                        className="p-3 rounded-full text-slate-400 hover:text-white hover:bg-white/10 transition-colors"
-                        style={{ color: showColorPicker ? 'white' : color }}
-                    >
-                        <Palette size={18} />
-                    </button>
-                    {showColorPicker && (
-                        <div className={`absolute top-0 ${popoverSideClass} bg-slate-800 border border-slate-700 rounded-xl p-3 shadow-2xl flex flex-col gap-2`}>
-                            {COLORS.map(c => (
-                                <button 
-                                key={c}
-                                onClick={() => {
-                                    setColor(c);
-                                    setShowColorPicker(false);
-                                }}
-                                className={`w-8 h-8 rounded-full border-2 ${color === c ? 'border-white scale-110' : 'border-transparent'}`}
-                                style={{ backgroundColor: c }}
-                                />
-                            ))}
-                        </div>
-                    )}
-                 </div>
-             )}
-
-             {/* Settings Toggle */}
-             {tool === 'pen' && (
-                <div className="relative">
-                    <button 
-                        onClick={() => {
-                            setShowPenSettings(!showPenSettings);
-                            setShowColorPicker(false);
-                        }}
-                        className={`p-3 rounded-full transition-colors ${showPenSettings ? 'bg-white/20 text-white' : 'text-slate-400 hover:text-white hover:bg-white/10'}`}
-                    >
-                        <Sliders size={18} />
-                    </button>
-                    {showPenSettings && (
-                        <div className={`absolute top-0 ${popoverSideClass} bg-slate-800 border border-slate-700 rounded-xl p-4 shadow-2xl w-56`}>
-                            <h4 className="text-xs font-bold text-slate-500 uppercase tracking-wider mb-3">Pen Options</h4>
-                            <div className="bg-slate-900 rounded-lg p-3 mb-4 border border-slate-700/50 flex items-center justify-center overflow-hidden">
-                                <svg width="160" height="40" className="block">
-                                    <path d="M 20 20 Q 80 5, 140 20" stroke={hexToRgba(color, opacity)} strokeWidth={lineWidth} fill="none" strokeLinecap="round" />
-                                </svg>
+                        {showFontPicker && (
+                            <div className="absolute bottom-[calc(100%+1.5rem)] left-0 w-64 bg-slate-900/98 backdrop-blur-3xl border border-white/10 rounded-3xl shadow-[0_25px_50px_-12px_rgba(0,0,0,0.9)] overflow-hidden z-[100]" onClick={e => e.stopPropagation()}>
+                                <div className="p-3 border-b border-white/5 relative">
+                                    <Search className="absolute left-6 top-1/2 -translate-y-1/2 text-slate-500" size={14} />
+                                    <input 
+                                        ref={fontSearchInputRef}
+                                        type="text" 
+                                        placeholder="Search fonts..."
+                                        className="w-full bg-black/40 border border-white/10 rounded-2xl pl-10 pr-4 py-2.5 text-xs text-white outline-none focus:ring-1 focus:ring-blue-500"
+                                        value={fontSearchQuery}
+                                        onChange={e => setFontSearchQuery(e.target.value)}
+                                        autoFocus
+                                    />
+                                </div>
+                                <div className="max-h-60 overflow-y-auto py-2 no-scrollbar">
+                                    {filteredFonts.map(f => (
+                                        <button 
+                                            key={f.value}
+                                            onClick={() => { setSelectedFont(f.value); setShowFontPicker(false); setFontSearchQuery(''); }}
+                                            className={`w-full flex items-center justify-between px-5 py-3.5 hover:bg-white/10 transition-colors text-left ${selectedFont === f.value ? 'text-blue-400' : 'text-slate-300'}`}
+                                        >
+                                            <span className="text-sm font-medium" style={{ fontFamily: f.value }}>{f.label}</span>
+                                            {selectedFont === f.value && <Check size={16} />}
+                                        </button>
+                                    ))}
+                                </div>
                             </div>
-                            <div className="mb-4">
-                                <div className="flex justify-between mb-1"><span className="text-xs text-slate-400">Width</span><span className="text-xs text-slate-300">{lineWidth}px</span></div>
-                                <input type="range" min="1" max="20" step="1" value={lineWidth} onChange={(e) => setLineWidth(parseInt(e.target.value))} className="w-full h-2 bg-slate-700 rounded-lg appearance-none cursor-pointer accent-blue-500" />
-                            </div>
-                            <div>
-                                <div className="flex justify-between mb-1"><span className="text-xs text-slate-400">Opacity</span><span className="text-xs text-slate-300">{Math.round(opacity * 100)}%</span></div>
-                                <input type="range" min="0.1" max="1.0" step="0.1" value={opacity} onChange={(e) => setOpacity(parseFloat(e.target.value))} className="w-full h-2 bg-slate-700 rounded-lg appearance-none cursor-pointer accent-blue-500" />
-                            </div>
-                        </div>
-                    )}
+                        )}
+                    </div>
                 </div>
-             )}
+              )}
 
-             <div className="w-8 h-px bg-white/10 my-1" />
-
-             <button onClick={handleUndo} className="p-3 text-slate-400 hover:text-white hover:bg-white/10 rounded-full" title="Undo">
-                <Undo size={18} />
-             </button>
-             
-             <button onClick={handleClear} className="p-3 text-slate-400 hover:text-red-500 hover:bg-red-500/10 rounded-full" title="Clear Page">
-                <Trash2 size={18} />
-             </button>
-             
-             <button onClick={() => setIsDrawingMode(false)} className="p-3 text-slate-400 hover:text-white hover:bg-white/10 rounded-full" title="Close">
-                 <X size={18} />
-             </button>
-         </div>
+              <div className="w-px h-8 bg-white/10 shrink-0" />
+              
+              <button onClick={() => { const updated = allStrokes.filter(s => s.fileIndex !== activeFileIndex || s.pageIndex !== subPageIndex); setAllStrokes(updated); storage.saveAnnotation(sheetId, updated); }} className="p-2.5 text-slate-500 hover:text-red-400 transition-colors shrink-0" title="Clear Page"><RotateCcw size={20} /></button>
+              
+              <button onClick={() => { setIsAnnotating(false); setShowFontPicker(false); setShowSizePicker(false); }} className="bg-white/10 hover:bg-blue-600 text-white px-6 py-2.5 rounded-full text-[10px] font-black uppercase tracking-[0.1em] transition-all shrink-0">Done</button>
+          </div>
       )}
 
-      {/* Main Content Area */}
-      <div className="flex-1 relative flex items-center justify-center bg-zinc-900 overflow-hidden">
-        {(loading || (!workerReady && fileType === 'application/pdf')) ? (
-          <div className="animate-spin text-white"><Settings2 size={40} /></div>
-        ) : (fileType === 'application/pdf' ? pdfDoc : blobUrl) ? (
-            <div 
-                ref={containerRef}
-                className={`relative w-full h-full flex items-center justify-center select-none ${isDrawingMode ? 'cursor-crosshair' : ''}`}
-                style={{ touchAction: 'none' }} // Critical for preventing scroll on mobile while drawing
-                onMouseDown={handlePointerDown}
-                onMouseMove={handlePointerMove}
-                onMouseUp={handlePointerUp}
-                onMouseLeave={handlePointerUp}
-                onTouchStart={handlePointerDown}
-                onTouchMove={handlePointerMove}
-                onTouchEnd={handlePointerUp}
-            >
-                {fileType === 'application/pdf' ? (
-                     <canvas 
-                        ref={pdfCanvasRef} 
-                        className="shadow-2xl pointer-events-none"
-                        style={{ maxWidth: '100%', maxHeight: '100%' }}
-                     />
-                ) : (
-                    <img 
-                        src={blobUrl || ''} 
-                        alt={`Page ${subPageIndex + 1}`} 
-                        className="max-w-full max-h-full object-contain pointer-events-none select-none shadow-2xl"
-                    />
-                )}
-
-                {/* SVG Overlay for Annotations */}
-                <svg 
-                    ref={svgRef}
-                    className="absolute inset-0 w-full h-full pointer-events-none" 
-                    viewBox={`0 0 ${dimensions.width} ${dimensions.height}`}
-                    preserveAspectRatio="none"
-                >
-                    {visibleStrokes.map((stroke, i) => (
-                        <path 
-                            key={i}
-                            d={getSvgPath(stroke.points)}
-                            stroke={stroke.color}
-                            strokeWidth={stroke.width}
-                            fill="none"
-                            strokeLinecap="round"
-                            strokeLinejoin="round"
-                        />
-                    ))}
-                    {currentStroke && (
-                        <path 
-                            d={getSvgPath(currentStroke.points)}
-                            stroke={currentStroke.color}
-                            strokeWidth={currentStroke.width}
-                            fill="none"
-                            strokeLinecap="round"
-                            strokeLinejoin="round"
-                        />
-                    )}
-                </svg>
-            </div>
-        ) : (
-          <div className="text-white/50">Error loading file</div>
-        )}
-
-        {/* Navigation Hit Zones */}
-        {!isDrawingMode && !showPageNav && !showPenSettings && !showColorPicker && (
-          <>
-            <div className="absolute inset-y-0 left-0 w-[20%] z-10 cursor-pointer" onClick={handlePagePrev} />
-            <div className="absolute inset-y-0 right-0 w-[20%] z-10 cursor-pointer" onClick={handlePageNext} />
-          </>
-        )}
-      </div>
-
-      {/* Bottom Control Hint */}
-      {!isDrawingMode && !showPageNav && !showPenSettings && !showQueueMenu && (
-        <div className="absolute bottom-6 left-1/2 -translate-x-1/2 flex items-center gap-8 z-20 pointer-events-none opacity-0 hover:opacity-100 transition-opacity">
-           <button 
-             className={`p-4 bg-black/50 rounded-full backdrop-blur pointer-events-auto hover:bg-black/80 transition-all ${(!hasPrev && activeFileIndex === 0 && subPageIndex === 0) ? 'opacity-30 cursor-not-allowed' : ''}`}
-             onClick={handlePagePrev}
-             disabled={!hasPrev && activeFileIndex === 0 && subPageIndex === 0}
-           >
-             <ChevronLeft size={32} />
-           </button>
-           <button 
-             className={`p-4 bg-black/50 rounded-full backdrop-blur pointer-events-auto hover:bg-black/80 transition-all ${(!hasNext && activeFileIndex === (sheet?.pages.length || 1) - 1 && subPageIndex === numSubPages - 1) ? 'opacity-30 cursor-not-allowed' : ''}`}
-             onClick={handlePageNext}
-             disabled={!hasNext && activeFileIndex === (sheet?.pages.length || 1) - 1 && subPageIndex === numSubPages - 1}
-           >
-             <ChevronRight size={32} />
-           </button>
-        </div>
+      {showQueue && queue && (
+          <div className="absolute top-20 right-4 z-[100] w-64 bg-slate-900/95 backdrop-blur-2xl border border-white/10 rounded-2xl shadow-2xl flex flex-col overflow-hidden">
+              <div className="p-4 border-b border-white/5 flex items-center justify-between"><h3 className="text-xs font-black text-slate-500 uppercase tracking-[0.2em]">Queue</h3><button onClick={() => setShowQueue(false)} className="text-slate-500 hover:text-white"><X size={16}/></button></div>
+              <div className="overflow-y-auto no-scrollbar py-2 max-h-[60vh]">
+                  {queue.map((item, idx) => (
+                      <button key={idx} onClick={() => { onJumpTo(idx); setShowQueue(false); }} className={`w-full flex items-center gap-3 px-4 py-3 hover:bg-white/5 transition-colors text-left ${idx === currentQueueIndex ? 'bg-blue-600/20 text-blue-400 border-l-4 border-blue-500' : 'text-slate-300'}`}><span className="text-[10px] font-mono text-slate-500 w-4">{idx + 1}</span><span className="text-sm font-medium truncate flex-1">{item.name}</span></button>
+                  ))}
+              </div>
+          </div>
       )}
     </div>
   );

@@ -1,3 +1,4 @@
+
 import React, { useState, useEffect, useCallback } from 'react';
 import { createRoot } from 'react-dom/client';
 import { AppView, Sheet, Setlist, ViewerState } from './types';
@@ -106,6 +107,7 @@ const App: React.FC = () => {
 
     return (
       <Viewer 
+        key={currentSheetId} // CRITICAL: Reset internal state when changing pieces
         sheetId={currentSheetId}
         title={getCurrentSheetTitle()}
         onClose={closeViewer}

@@ -1,3 +1,4 @@
+
 import { DB_NAME, DB_VERSION, STORES, INITIAL_TAGS } from '../constants';
 import { Sheet, Setlist, AnnotationLayer, SheetPage, TagDef } from '../types';
 
@@ -28,11 +29,22 @@ class StorageService {
         }
         if (!db.objectStoreNames.contains(STORES.TAGS)) {
           const tagStore = db.createObjectStore(STORES.TAGS, { keyPath: 'label' });
-          // Populate default tags
           INITIAL_TAGS.forEach(tag => tagStore.add(tag));
         }
       };
     });
+  }
+
+  /**
+   * Clears all stored data (sheets, setlists, and annotations).
+   * Can be used to reset the application state.
+   */
+  async clearDatabase(): Promise<void> {
+    if (!this.db) await this.init();
+    const stores = [STORES.SHEETS, STORES.SETLISTS, STORES.ANNOTATIONS];
+    for (const storeName of stores) {
+      await this.transaction(storeName, 'readwrite', (store) => store.clear());
+    }
   }
 
   private async transaction<T>(storeName: string, mode: IDBTransactionMode, callback: (store: IDBObjectStore) => IDBRequest | void): Promise<T> {
@@ -57,7 +69,6 @@ class StorageService {
   // --- Sheets ---
 
   async addSheet(sheet: Sheet): Promise<void> {
-    // We store the pages directly in IDB (blobs are supported)
     await this.transaction(STORES.SHEETS, 'readwrite', (store) => store.put(sheet));
   }
 
@@ -65,20 +76,16 @@ class StorageService {
     const existing = await this.transaction<Sheet>(STORES.SHEETS, 'readonly', (store) => store.get(sheet.id));
     if (!existing) throw new Error('Sheet not found');
     
-    // Preserve pages, update metadata (name, tags, tagIcons)
     const record: Sheet = { 
       ...existing, 
       name: sheet.name, 
       tags: sheet.tags,
-      tagIcons: sheet.tagIcons // Persist the custom icon map
+      tagIcons: sheet.tagIcons
     };
     await this.transaction(STORES.SHEETS, 'readwrite', (store) => store.put(record));
   }
 
   async getAllSheets(): Promise<Sheet[]> {
-    // Fetches metadata + blobs. 
-    // Optimization: In a real app we might store blobs in a separate store to keep listing fast, 
-    // but for IndexedDB local app, fetching all is usually acceptable for < 100mb data.
     return this.transaction(STORES.SHEETS, 'readonly', (store) => store.getAll());
   }
 
@@ -87,13 +94,8 @@ class StorageService {
   }
 
   async deleteSheet(id: string): Promise<void> {
-    // 1. Delete the sheet itself
     await this.transaction(STORES.SHEETS, 'readwrite', (store) => store.delete(id));
-    
-    // 2. Delete annotations
     await this.deleteAnnotation(id);
-
-    // 3. Remove this sheet ID from ALL setlists
     const setlists = await this.getAllSetlists();
     for (const list of setlists) {
         if (list.sheetIds.includes(id)) {

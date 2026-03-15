@@ -1,5 +1,6 @@
-import React, { useState, useMemo, useRef } from 'react';
-import { Plus, ListMusic, Trash2, Play, MoveVertical, X, Check, Pencil, GripVertical, Search, Import, FileWarning, AlertTriangle, Copy, Save } from 'lucide-react';
+
+import React, { useState, useMemo, useRef, useEffect } from 'react';
+import { Plus, ListMusic, Trash2, Play, X, Check, Pencil, GripVertical, Search, Import, AlertTriangle, FileWarning, RefreshCw, Copy, FileText } from 'lucide-react';
 import { Setlist, Sheet } from '../types';
 import { storage } from '../services/storage';
 import { processBatchImport } from '../utils/fileProcessor';
@@ -22,30 +23,24 @@ interface ConflictState {
     setlistName?: string;
 }
 
-interface ErrorModalState {
-    isOpen: boolean;
-    message: string;
-}
-
 const Setlists: React.FC<SetlistsProps> = ({ setlists, sheets, onRefresh, onPlay }) => {
   const [isEditing, setIsEditing] = useState(false);
   const [editingId, setEditingId] = useState<string | null>(null);
   const [newSetName, setNewSetName] = useState('');
   const [selectedSheetIds, setSelectedSheetIds] = useState<string[]>([]);
+  
+  // DRAG STATE
   const [draggedIndex, setDraggedIndex] = useState<number | null>(null);
+  const [hoverIndex, setHoverIndex] = useState<number | null>(null);
+  const [dragOffset, setDragOffset] = useState(0);
+  const startPointerY = useRef(0);
+  const itemHeights = useRef<number[]>([]);
+  const containerRect = useRef<DOMRect | null>(null);
+  const containerRef = useRef<HTMLDivElement>(null);
   
-  // Delete Modal State
   const [deleteModal, setDeleteModal] = useState<DeleteModalState>({ isOpen: false, setlist: null });
-  
-  // Import Conflict Modal State
   const [conflictData, setConflictData] = useState<ConflictState | null>(null);
-  
-  // Error Modal State
-  const [errorModal, setErrorModal] = useState<ErrorModalState>({ isOpen: false, message: '' });
-
   const importInputRef = useRef<HTMLInputElement>(null);
-
-  // Search States
   const [listSearch, setListSearch] = useState('');
   const [librarySearch, setLibrarySearch] = useState('');
   
@@ -53,7 +48,6 @@ const Setlists: React.FC<SetlistsProps> = ({ setlists, sheets, onRefresh, onPlay
     setEditingId(null);
     setNewSetName('');
     setSelectedSheetIds([]);
-    setLibrarySearch('');
     setIsEditing(true);
   };
 
@@ -61,69 +55,123 @@ const Setlists: React.FC<SetlistsProps> = ({ setlists, sheets, onRefresh, onPlay
     setEditingId(setlist.id);
     setNewSetName(setlist.name);
     setSelectedSheetIds([...setlist.sheetIds]);
-    setLibrarySearch('');
     setIsEditing(true);
   };
 
   const handleSave = async () => {
     if (!newSetName.trim()) return;
-    
     const existingSetlist = editingId ? setlists.find(s => s.id === editingId) : null;
-    
     const setlist: Setlist = {
       id: editingId || crypto.randomUUID(),
       name: newSetName,
       sheetIds: selectedSheetIds,
       dateCreated: existingSetlist ? existingSetlist.dateCreated : Date.now(),
     };
-    
     await storage.saveSetlist(setlist);
-    closeEditor();
+    setIsEditing(false);
     onRefresh();
   };
 
-  const closeEditor = () => {
-    setIsEditing(false);
-    setEditingId(null);
-    setNewSetName('');
-    setSelectedSheetIds([]);
-  };
-
-  // Toggle selection: append to end if adding, remove if existing
   const toggleSelection = (id: string) => {
     setSelectedSheetIds(prev => 
       prev.includes(id) ? prev.filter(sid => sid !== id) : [...prev, id]
     );
   };
 
-  // DnD Handlers
-  const handleDragStart = (e: React.DragEvent, index: number) => {
-    setDraggedIndex(index);
-    // Required for Firefox
-    e.dataTransfer.effectAllowed = 'move';
-    e.dataTransfer.setData('text/plain', index.toString());
-  };
+  // --- REORDERING LOGIC ---
 
-  const handleDragOver = (e: React.DragEvent, index: number) => {
-    e.preventDefault();
-    e.dataTransfer.dropEffect = 'move';
-  };
-
-  const handleDrop = (e: React.DragEvent, targetIndex: number) => {
-    e.preventDefault();
-    if (draggedIndex === null || draggedIndex === targetIndex) return;
-
-    const newIds = [...selectedSheetIds];
-    const [removed] = newIds.splice(draggedIndex, 1);
-    newIds.splice(targetIndex, 0, removed);
+  const handlePointerDown = (e: React.PointerEvent, index: number) => {
+    const target = e.currentTarget as HTMLElement;
+    target.setPointerCapture(e.pointerId);
     
-    setSelectedSheetIds(newIds);
+    if (containerRef.current) {
+        containerRect.current = containerRef.current.getBoundingClientRect();
+        const children = Array.from(containerRef.current.children);
+        // Fix: Cast child to HTMLElement to avoid 'unknown' type error in getBoundingClientRect call
+        itemHeights.current = children.map(child => (child as HTMLElement).getBoundingClientRect().height + 8); 
+    }
+    
+    startPointerY.current = e.clientY;
+    setDraggedIndex(index);
+    setHoverIndex(index);
+    setDragOffset(0);
+  };
+
+  const handlePointerMove = (e: React.PointerEvent) => {
+    if (draggedIndex === null || !containerRect.current) return;
+    
+    const currentY = e.clientY;
+    const deltaY = currentY - startPointerY.current;
+    setDragOffset(deltaY);
+
+    const relativeY = currentY - containerRect.current.top + (containerRef.current?.scrollTop || 0);
+    
+    let currentTotalHeight = 0;
+    let newHoverIndex = 0;
+    
+    for (let i = 0; i < itemHeights.current.length; i++) {
+        const h = itemHeights.current[i];
+        if (relativeY > currentTotalHeight + h / 2) {
+            newHoverIndex = i;
+        }
+        currentTotalHeight += h;
+    }
+    
+    const clampedIndex = Math.max(0, Math.min(newHoverIndex, selectedSheetIds.length - 1));
+    if (clampedIndex !== hoverIndex) {
+        setHoverIndex(clampedIndex);
+    }
+  };
+
+  const handlePointerUp = (e: React.PointerEvent) => {
+    if (draggedIndex !== null && hoverIndex !== null && draggedIndex !== hoverIndex) {
+        const newIds = [...selectedSheetIds];
+        const [removed] = newIds.splice(draggedIndex, 1);
+        newIds.splice(hoverIndex, 0, removed);
+        setSelectedSheetIds(newIds);
+    }
+    
+    const target = e.currentTarget as HTMLElement;
+    if (target.hasPointerCapture(e.pointerId)) {
+        target.releasePointerCapture(e.pointerId);
+    }
     setDraggedIndex(null);
+    setHoverIndex(null);
+    setDragOffset(0);
+  };
+
+  const getItemStyle = (index: number) => {
+    if (draggedIndex === null || hoverIndex === null) return {};
+
+    if (index === draggedIndex) {
+        return {
+            transform: `translateY(${dragOffset}px) scale(1.03)`,
+            zIndex: 50,
+            boxShadow: '0 25px 50px -12px rgb(0 0 0 / 0.8)',
+            borderColor: '#3b82f6', 
+            backgroundColor: '#1e293b', 
+            transition: 'none',
+        };
+    }
+
+    let shift = 0;
+    const height = itemHeights.current[draggedIndex] || 64;
+
+    if (draggedIndex < hoverIndex) {
+        if (index > draggedIndex && index <= hoverIndex) shift = -height;
+    } else if (draggedIndex > hoverIndex) {
+        if (index < draggedIndex && index >= hoverIndex) shift = height;
+    }
+
+    return {
+        transform: `translateY(${shift}px)`,
+        transition: 'transform 0.25s cubic-bezier(0.2, 0, 0, 1)',
+    };
   };
 
   const handleDeleteClick = (e: React.MouseEvent, setlist: Setlist) => {
     e.stopPropagation();
-    setDeleteModal({ isOpen: true, setlist: setlist });
+    setDeleteModal({ isOpen: true, setlist });
   };
 
   const confirmDelete = async () => {
@@ -134,80 +182,68 @@ const Setlists: React.FC<SetlistsProps> = ({ setlists, sheets, onRefresh, onPlay
       }
   };
 
-  // Step 1: Initiate Import
   const handleImportSetlist = async (e: React.ChangeEvent<HTMLInputElement>) => {
     if (e.target.files && e.target.files.length > 0) {
         const result = await processBatchImport(e.target.files);
-        if (result.error) {
-            setErrorModal({ isOpen: true, message: result.error });
-            if (e.target) e.target.value = '';
-            return;
-        }
-
         if (result.sheets.length > 0) {
-            // Check for duplicates in library by fetching fresh state
             const currentSheets = await storage.getAllSheets();
-            
             const duplicates = result.sheets.filter(newSheet => 
                 currentSheets.some(existing => existing.name.trim().toLowerCase() === newSheet.name.trim().toLowerCase())
             );
 
             if (duplicates.length > 0) {
-                setConflictData({ newSheets: result.sheets, duplicates, setlistName: result.setlistName });
+                setConflictData({ 
+                    newSheets: result.sheets, 
+                    duplicates, 
+                    setlistName: result.setlistName 
+                });
             } else {
                 await finalizeSetlistImport(result.sheets, false, result.setlistName);
             }
-        } else {
-            alert("No valid files found for import.");
+        } else if (result.error) {
+            alert(result.error);
         }
     }
     if (e.target) e.target.value = '';
   };
 
-  // Step 2: Finalize Import
   const finalizeSetlistImport = async (newSheets: Sheet[], overwrite: boolean, setlistName?: string) => {
-        const currentSheets = await storage.getAllSheets();
-        
-        // Prepare sheets for saving, handling overwrites
-        const sheetsToSave = newSheets.map(sheet => {
-            const existing = currentSheets.find(s => s.name.trim().toLowerCase() === sheet.name.trim().toLowerCase());
-            if (existing && overwrite) {
-                // Reuse existing ID to overwrite content but keep metadata
-                return {
-                    ...sheet,
-                    id: existing.id,
-                    tags: existing.tags,
-                    tagIcons: existing.tagIcons,
-                    dateAdded: Date.now()
-                };
-            }
-            return sheet;
-        });
+      const currentSheets = await storage.getAllSheets();
+      const finalSheetIds: string[] = [];
 
-        // Save all sheets
-        for (const sheet of sheetsToSave) {
-            await storage.addSheet(sheet);
-        }
+      for (const sheet of newSheets) {
+          const existing = currentSheets.find(s => s.name.trim().toLowerCase() === sheet.name.trim().toLowerCase());
+          let sheetToSave = sheet;
+          
+          if (existing && overwrite) {
+              sheetToSave = {
+                  ...sheet,
+                  id: existing.id, 
+                  tags: existing.tags,
+                  tagIcons: existing.tagIcons,
+                  dateAdded: Date.now()
+              };
+          }
+          await storage.addSheet(sheetToSave);
+          finalSheetIds.push(sheetToSave.id);
+      }
 
-        // Create Setlist
-        // Sort sheets alphabetically for the setlist
-        const sortedSheets = [...sheetsToSave].sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true }));
-        const sortedIds = sortedSheets.map(s => s.id);
+      finalSheetIds.sort((a, b) => {
+          const sA = newSheets.find(s => s.id === a || (overwrite && s.name === currentSheets.find(ex => ex.id === a)?.name));
+          const sB = newSheets.find(s => s.id === b || (overwrite && s.name === currentSheets.find(ex => ex.id === b)?.name));
+          return (sA?.name || '').localeCompare(sB?.name || '', undefined, { numeric: true });
+      });
 
-        const name = setlistName || "Imported Setlist";
-        
-        const newSetlist: Setlist = {
-            id: crypto.randomUUID(),
-            name: name,
-            sheetIds: sortedIds,
-            dateCreated: Date.now()
-        };
-        
-        await storage.saveSetlist(newSetlist);
-        
-        setConflictData(null);
-        setTimeout(() => alert(`Imported ${sheetsToSave.length} sheets and created setlist "${name}".`), 100);
-        onRefresh();
+      const newSetlist: Setlist = {
+          id: crypto.randomUUID(),
+          name: setlistName || "Imported Setlist",
+          sheetIds: finalSheetIds,
+          dateCreated: Date.now()
+      };
+      
+      await storage.saveSetlist(newSetlist);
+      setConflictData(null);
+      onRefresh();
   };
 
   const filteredSetlists = useMemo(() => {
@@ -217,117 +253,96 @@ const Setlists: React.FC<SetlistsProps> = ({ setlists, sheets, onRefresh, onPlay
 
   const filteredLibrary = useMemo(() => {
     const q = librarySearch.toLowerCase();
-    return sheets.filter(s => 
-        s.name.toLowerCase().includes(q) || 
-        (s.tags && s.tags.some(t => t.toLowerCase().includes(q)))
-    );
+    return sheets.filter(s => s.name.toLowerCase().includes(q) || (s.tags && s.tags.some(t => t.toLowerCase().includes(q))));
   }, [sheets, librarySearch]);
 
   if (isEditing) {
     return (
       <div className="p-6 h-full flex flex-col">
         <div className="flex items-center justify-between mb-6">
-           <h2 className="text-2xl font-bold text-white">{editingId ? 'Edit Setlist' : 'New Setlist'}</h2>
+           <h2 className="text-2xl font-bold text-white tracking-tight">{editingId ? 'Edit Setlist' : 'New Setlist'}</h2>
            <div className="flex gap-2">
-             <button onClick={closeEditor} className="p-2 text-slate-400 hover:text-white"><X /></button>
-             <button 
-                onClick={handleSave} 
-                disabled={!newSetName || selectedSheetIds.length === 0}
-                className="flex items-center gap-2 bg-green-600 hover:bg-green-500 disabled:opacity-50 disabled:cursor-not-allowed text-white px-4 py-2 rounded-lg"
-             >
-                <Check size={18} />
-                <span>Save</span>
+             <button onClick={() => setIsEditing(false)} className="px-4 py-2 text-slate-400 hover:text-white transition-colors font-medium">Cancel</button>
+             <button onClick={handleSave} disabled={!newSetName || selectedSheetIds.length === 0} className="flex items-center gap-2 bg-green-600 text-white px-5 py-2.5 rounded-xl hover:bg-green-500 disabled:opacity-50 transition-all shadow-lg shadow-green-900/20 active:scale-95">
+                <Check size={18} /> <span className="font-bold">Save Setlist</span>
              </button>
            </div>
         </div>
-
-        <input 
-          type="text" 
-          placeholder="Setlist Name (e.g., Wedding Gig)"
-          className="w-full bg-slate-800 border border-slate-700 rounded-lg p-3 text-white mb-6 focus:ring-2 focus:ring-blue-500 outline-none"
-          value={newSetName}
-          onChange={e => setNewSetName(e.target.value)}
-        />
+        
+        <div className="relative mb-6">
+            <input 
+                type="text" 
+                placeholder="Ex: Tonight's Performance, Jazz Set, etc." 
+                className="w-full bg-slate-800 border-2 border-slate-700 rounded-xl p-4 text-xl text-white focus:border-blue-500 outline-none transition-colors" 
+                value={newSetName} 
+                onChange={e => setNewSetName(e.target.value)} 
+            />
+        </div>
 
         <div className="flex-1 flex flex-col md:flex-row gap-6 overflow-hidden">
-            {/* Library Selection */}
-            <div className="flex-1 overflow-hidden flex flex-col bg-slate-800/50 rounded-xl p-4">
-                <h3 className="text-sm font-bold text-slate-500 uppercase tracking-wider mb-3">Library (Tap to add)</h3>
-                
-                {/* Library Filter */}
-                <div className="relative mb-3">
-                    <Search className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-500" size={14} />
-                    <input 
-                        type="text" 
-                        placeholder="Filter library..." 
-                        className="w-full bg-slate-900 border border-slate-700 rounded-md pl-9 pr-3 py-2 text-sm text-slate-200 focus:outline-none focus:border-blue-500"
-                        value={librarySearch}
-                        onChange={(e) => setLibrarySearch(e.target.value)}
-                    />
+            <div className="flex-1 overflow-hidden flex flex-col bg-slate-800/40 rounded-2xl p-4 border border-slate-700/50">
+                <h3 className="text-[10px] font-black text-slate-500 uppercase tracking-[0.2em] mb-4">Add Library Pieces</h3>
+                <div className="relative mb-4">
+                    <Search className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-500" size={16} />
+                    <input type="text" placeholder="Search library..." className="w-full bg-slate-900 border border-slate-700 rounded-lg pl-10 pr-4 py-2.5 text-sm text-slate-200 outline-none focus:ring-1 focus:ring-blue-500" value={librarySearch} onChange={(e) => setLibrarySearch(e.target.value)} />
                 </div>
-
-                <div className="overflow-y-auto space-y-2 flex-1">
+                <div className="overflow-y-auto space-y-2 flex-1 no-scrollbar">
                     {filteredLibrary.map(sheet => {
                         const isSelected = selectedSheetIds.includes(sheet.id);
                         return (
-                            <div 
-                                key={sheet.id}
-                                onClick={() => !isSelected && toggleSelection(sheet.id)}
-                                className={`flex items-center p-3 rounded-lg border transition-all ${isSelected ? 'opacity-50 cursor-not-allowed border-slate-700' : 'cursor-pointer bg-slate-800 border-transparent hover:bg-slate-700'}`}
+                            <button 
+                                key={sheet.id} 
+                                onClick={() => !isSelected && toggleSelection(sheet.id)} 
+                                className={`w-full flex items-center p-3 rounded-xl border-2 transition-all text-left ${isSelected ? 'opacity-40 border-slate-700 bg-transparent grayscale' : 'cursor-pointer bg-slate-800 border-transparent hover:bg-slate-700 hover:border-blue-500/30'}`}
                             >
-                                <div className={`w-6 h-6 rounded-full flex items-center justify-center mr-3 text-xs font-bold shrink-0 ${isSelected ? 'bg-slate-600 text-slate-400' : 'bg-blue-600 text-white'}`}>
-                                    {isSelected ? <Check size={12}/> : <Plus size={12} />}
+                                <div className={`w-7 h-7 rounded-lg flex items-center justify-center mr-3 shrink-0 transition-colors ${isSelected ? 'bg-slate-700' : 'bg-blue-600'}`}>
+                                    {isSelected ? <Check size={14}/> : <Plus size={14} />}
                                 </div>
-                                <div className="min-w-0">
-                                    <div className="text-slate-200 truncate text-sm">{sheet.name}</div>
-                                    {sheet.tags && sheet.tags.length > 0 && (
-                                        <div className="flex gap-1 mt-1">
-                                            {sheet.tags.slice(0,2).map(t => <span key={t} className="text-[10px] bg-slate-700 px-1 rounded text-slate-400">{t}</span>)}
-                                        </div>
-                                    )}
-                                </div>
-                            </div>
+                                <span className="text-slate-200 text-sm font-medium truncate">{sheet.name}</span>
+                            </button>
                         );
                     })}
-                    {filteredLibrary.length === 0 && (
-                        <div className="text-center text-slate-500 text-sm py-4">No matching sheets</div>
-                    )}
                 </div>
             </div>
 
-            {/* Selected Order with DnD */}
-            <div className="flex-1 overflow-y-auto min-h-0 bg-slate-800/50 rounded-xl p-4">
-                <h3 className="text-sm font-bold text-slate-500 uppercase tracking-wider mb-3">Selected Order (Drag to reorder)</h3>
+            <div className="flex-[1.5] overflow-y-auto min-h-0 bg-slate-800/40 rounded-2xl p-4 no-scrollbar border border-slate-700/50">
+                <h3 className="text-[10px] font-black text-slate-500 uppercase tracking-[0.2em] mb-4">Performance Order</h3>
                 {selectedSheetIds.length === 0 ? (
-                    <div className="text-slate-500 text-center py-8 italic">No sheets selected</div>
+                    <div className="flex flex-col items-center justify-center h-48 text-slate-500 italic text-sm">
+                        <ListMusic size={32} className="mb-2 opacity-20" />
+                        Select pieces from the library to build your set
+                    </div>
                 ) : (
-                    <div className="space-y-2">
+                    <div ref={containerRef} className="space-y-2 select-none relative pb-10">
                         {selectedSheetIds.map((id, index) => {
                             const sheet = sheets.find(s => s.id === id);
                             if (!sheet) return null;
-                            const isDragging = draggedIndex === index;
+                            const isBeingDragged = draggedIndex === index;
                             return (
                                 <div 
                                     key={`${id}-${index}`} 
-                                    draggable="true"
-                                    onDragStart={(e) => handleDragStart(e, index)}
-                                    onDragOver={(e) => handleDragOver(e, index)}
-                                    onDrop={(e) => handleDrop(e, index)}
-                                    onDragEnd={() => setDraggedIndex(null)}
-                                    className={`flex items-center bg-slate-800 p-2 rounded-lg border transition-all ${isDragging ? 'opacity-50 border-blue-500 bg-slate-700' : 'border-slate-700'}`}
+                                    style={getItemStyle(index)}
+                                    className="flex items-center bg-slate-800 p-2 rounded-xl border border-slate-700 relative group"
                                 >
-                                    <div className="p-2 text-slate-500 cursor-grab active:cursor-grabbing">
+                                    <div 
+                                        className="p-3 text-slate-500 cursor-grab active:cursor-grabbing touch-none transition-colors hover:text-white"
+                                        onPointerDown={(e) => handlePointerDown(e, index)}
+                                        onPointerMove={handlePointerMove}
+                                        onPointerUp={handlePointerUp}
+                                    >
                                         <GripVertical size={20} />
                                     </div>
-                                    <span className="w-6 text-center text-slate-500 font-mono text-sm">{index + 1}</span>
-                                    <span className="flex-1 truncate mx-2">{sheet.name}</span>
-                                    
+                                    <div className={`flex items-center flex-1 min-w-0 ${isBeingDragged ? 'pointer-events-none' : ''}`}>
+                                        <div className="w-6 h-6 flex items-center justify-center text-[10px] font-black text-slate-600 bg-slate-900 rounded-md shrink-0">
+                                            {index + 1}
+                                        </div>
+                                        <span className="flex-1 truncate mx-3 text-sm font-semibold text-white">{sheet.name}</span>
+                                    </div>
                                     <button 
-                                        onClick={() => toggleSelection(id)}
-                                        className="p-2 text-red-400 hover:bg-red-500/20 rounded ml-1"
-                                        title="Remove"
+                                        onClick={(e) => { e.stopPropagation(); toggleSelection(id); }} 
+                                        className={`p-3 text-slate-500 hover:text-red-500 transition-all ${isBeingDragged ? 'pointer-events-none opacity-0' : 'opacity-0 group-hover:opacity-100'}`}
                                     >
-                                        <Trash2 size={16} />
+                                        <Trash2 size={18} />
                                     </button>
                                 </div>
                             );
@@ -342,248 +357,127 @@ const Setlists: React.FC<SetlistsProps> = ({ setlists, sheets, onRefresh, onPlay
 
   return (
     <div className="p-6 pb-24">
-      <div className="flex flex-col md:flex-row md:items-start justify-between mb-8 gap-4">
+      <div className="flex flex-col md:flex-row md:items-start justify-between mb-8 gap-6">
         <div>
-           <h1 className="text-3xl font-bold text-white mb-1">Setlists</h1>
-           <p className="text-slate-400 text-sm">Organize your repertoire</p>
+            <h1 className="text-4xl font-black text-white mb-2">Setlists</h1>
+            <p className="text-slate-400 text-sm">Performance ready repertoire lists</p>
         </div>
-        <div className="flex gap-3 items-start">
-            <div className="relative md:w-64">
-                <Search className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" size={18} />
-                <input 
-                    type="text" 
-                    placeholder="Search setlists..." 
-                    className="w-full bg-slate-800 border border-slate-700 rounded-lg pl-10 pr-4 py-2.5 text-slate-200 focus:outline-none focus:ring-2 focus:ring-blue-500"
-                    value={listSearch}
-                    onChange={(e) => setListSearch(e.target.value)}
-                />
+        <div className="flex gap-3 items-center flex-wrap">
+            <div className="relative group">
+                <Search size={18} className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-500 group-focus-within:text-blue-500 transition-colors" />
+                <input type="text" placeholder="Search sets..." className="bg-slate-800 border border-slate-700 rounded-xl pl-10 pr-4 py-2.5 text-white focus:border-blue-500 outline-none transition-all w-full md:w-48 lg:w-64" value={listSearch} onChange={(e) => setListSearch(e.target.value)} />
             </div>
             
-            <div className="flex flex-col gap-2">
-                <button 
-                    onClick={() => importInputRef.current?.click()}
-                    className="w-full flex items-center justify-center gap-2 bg-indigo-600 hover:bg-indigo-500 text-white px-4 py-2.5 rounded-lg shadow-lg active:scale-95 transition-all whitespace-nowrap"
-                    title="Import a folder as a setlist (Batch Import + Auto Create Setlist)"
-                >
-                    <Import size={20} />
-                    <span className="hidden sm:inline">Import Setlist</span>
-                </button>
-                
-                <button 
-                    onClick={startCreate}
-                    className="w-full flex items-center justify-center gap-2 bg-blue-600 hover:bg-blue-500 text-white px-4 py-2.5 rounded-lg shadow-lg active:scale-95 transition-all whitespace-nowrap"
-                >
-                    <Plus size={20} />
-                    <span className="hidden sm:inline">New Setlist</span>
-                </button>
-            </div>
+            <button onClick={() => importInputRef.current?.click()} className="flex items-center gap-2 bg-indigo-600/10 text-indigo-400 border border-indigo-600/20 px-4 py-2 rounded-xl hover:bg-indigo-600 hover:text-white transition-all shadow-lg active:scale-95">
+                <Import size={16} />
+                <span className="font-bold text-xs">Import Set</span>
+            </button>
             
-            <input 
-                type="file" 
-                ref={importInputRef} 
-                className="hidden" 
+            <button onClick={startCreate} className="flex items-center gap-2 bg-blue-600 text-white px-5 py-2 rounded-xl hover:bg-blue-500 transition-all shadow-xl shadow-blue-900/20 active:scale-95">
+                <Plus size={18} />
+                <span className="font-bold text-xs">Create New</span>
+            </button>
+            
+            <input type="file" ref={importInputRef} className="hidden" 
                 // @ts-ignore
-                webkitdirectory="" 
-                directory="" 
-                multiple 
-                onChange={handleImportSetlist} 
+                webkitdirectory="" directory="" multiple onChange={handleImportSetlist} 
             />
         </div>
       </div>
 
-      {setlists.length === 0 ? (
-        <div className="flex flex-col items-center justify-center h-64 border-2 border-dashed border-slate-700 rounded-2xl bg-slate-800/30">
-          <div className="bg-slate-800 p-4 rounded-full mb-4">
-             <ListMusic size={32} className="text-slate-400" />
-          </div>
-          <p className="text-lg text-slate-300 font-medium">No setlists yet</p>
-          <p className="text-slate-500 text-sm mt-1">Create one or import a folder</p>
-        </div>
-      ) : filteredSetlists.length === 0 ? (
-        <div className="text-center py-12 text-slate-500">
-            <p>No setlists found matching "{listSearch}"</p>
-        </div>
-      ) : (
-        <div className="space-y-4">
-          {filteredSetlists.map((list) => (
-            <div key={list.id} className="bg-slate-800 rounded-xl p-4 flex items-center justify-between group hover:bg-slate-750 transition-colors">
-               <div className="flex items-center gap-4 cursor-pointer flex-1" onClick={() => onPlay(list)}>
-                  <div className="w-12 h-12 bg-slate-700 rounded-lg flex items-center justify-center text-slate-400">
-                     <ListMusic size={24} />
-                  </div>
-                  <div>
-                      <h3 className="text-lg font-medium text-white">{list.name}</h3>
-                      <p className="text-sm text-slate-400">{list.sheetIds.length} pieces</p>
+      <div className="grid grid-cols-1 gap-4">
+          {filteredSetlists.map(list => (
+            <div key={list.id} className="bg-slate-800/80 rounded-2xl p-4 sm:p-5 flex items-center justify-between hover:bg-slate-800 hover:shadow-2xl transition-all border border-slate-700/50 group">
+               <div className="flex items-center gap-4 sm:gap-5 cursor-pointer flex-1 min-w-0" onClick={() => onPlay(list)}>
+                  <div className="p-3 bg-slate-900 rounded-2xl text-slate-500 group-hover:text-blue-400 transition-colors shrink-0"><ListMusic size={24} /></div>
+                  <div className="min-w-0">
+                      <h3 className="text-lg font-bold text-white group-hover:text-blue-400 transition-colors truncate">{list.name}</h3>
+                      <div className="flex items-center flex-wrap gap-x-2 gap-y-1 mt-1">
+                          <span className="text-[10px] font-black text-slate-500 uppercase tracking-widest whitespace-nowrap">{list.sheetIds.length} pieces</span>
+                          <span className="w-1 h-1 rounded-full bg-slate-700 hidden xs:block" />
+                          <span className="text-[10px] text-slate-500 whitespace-nowrap">{new Date(list.dateCreated).toLocaleDateString()}</span>
+                      </div>
                   </div>
                </div>
-
-               <div className="flex items-center gap-2">
-                   <button 
-                     onClick={() => onPlay(list)}
-                     className="p-3 bg-green-600 text-white rounded-full hover:bg-green-500 transition-colors shadow-lg shadow-green-900/20"
-                     title="Start Performance"
-                   >
-                       <Play size={20} fill="currentColor" />
+               <div className="flex items-center gap-2 ml-4 shrink-0">
+                   <button onClick={() => onPlay(list)} className="p-2 px-3 bg-green-600 text-white rounded-xl hover:bg-green-500 transition-all shadow-lg shadow-green-900/20 active:scale-90 flex items-center gap-1.5 group/play">
+                       <Play size={16} fill="currentColor" />
+                       <span className="font-black text-[9px] uppercase tracking-widest hidden sm:block">Start Gig</span>
                    </button>
-                   <div className="w-px h-8 bg-slate-700 mx-2" />
-                   <button 
-                      onClick={() => startEdit(list)}
-                      className="p-2 text-slate-400 hover:text-blue-400 transition-colors bg-slate-900/50 rounded-lg hover:bg-slate-900"
-                      title="Edit Setlist"
-                    >
-                       <Pencil size={18} />
-                   </button>
-                   <button 
-                      onClick={(e) => handleDeleteClick(e, list)}
-                      className="p-2 text-slate-400 hover:text-red-400 transition-colors bg-slate-900/50 rounded-lg hover:bg-slate-900"
-                      title="Delete Setlist"
-                    >
-                       <Trash2 size={18} />
-                   </button>
+                   <div className="w-px h-6 bg-slate-700 mx-1 hidden md:block" />
+                   <button onClick={() => startEdit(list)} className="p-2 text-slate-500 hover:text-blue-400 hover:bg-blue-400/10 rounded-xl transition-all"><Pencil size={16} /></button>
+                   <button onClick={(e) => handleDeleteClick(e, list)} className="p-2 text-slate-500 hover:text-red-500 hover:bg-red-500/10 rounded-xl transition-all"><Trash2 size={16} /></button>
                </div>
             </div>
           ))}
-        </div>
-      )}
 
-      {/* Error Modal for Import Structure */}
-      {errorModal.isOpen && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm p-4" onClick={() => setErrorModal({ isOpen: false, message: '' })}>
-            <div className="bg-slate-800 rounded-2xl w-full max-w-md border border-slate-700 shadow-2xl p-6" onClick={e => e.stopPropagation()}>
-                <div className="flex flex-col items-center text-center mb-6">
-                    <div className="w-16 h-16 bg-red-900/30 rounded-full flex items-center justify-center text-red-500 mb-4">
-                        <FileWarning size={32} />
-                    </div>
-                    <h3 className="text-xl font-bold text-white mb-2">Import Error</h3>
-                    <p className="text-red-300 text-sm mb-4 bg-red-500/10 p-3 rounded-lg border border-red-500/20">
-                        {errorModal.message}
-                    </p>
-                    
-                    <div className="text-left w-full bg-slate-900/50 p-4 rounded-xl border border-slate-700 space-y-3">
-                        <p className="text-xs text-slate-400 font-bold uppercase tracking-wider">Supported Folder Structures</p>
-                        
-                        <div className="flex gap-3">
-                            <div className="flex-1 space-y-1">
-                                <span className="text-xs text-blue-400 font-bold">1. Mixed Files</span>
-                                <div className="text-xs text-slate-500 font-mono bg-slate-950 p-2 rounded border border-slate-800 leading-relaxed">
-                                    Root/<br/>
-                                    ├── SongA.pdf<br/>
-                                    ├── SongB.jpg
-                                </div>
-                            </div>
-                            <div className="flex-1 space-y-1">
-                                <span className="text-xs text-blue-400 font-bold">2. Image Folders</span>
-                                <div className="text-xs text-slate-500 font-mono bg-slate-950 p-2 rounded border border-slate-800 leading-relaxed">
-                                    Root/<br/>
-                                    ├── SongC/<br/>
-                                    │   ├── 1.png<br/>
-                                    │   └── 2.png
-                                </div>
-                            </div>
-                        </div>
-                    </div>
-                </div>
+          {filteredSetlists.length === 0 && (
+              <div className="py-24 text-center">
+                  <p className="text-slate-500 font-medium">No setlists found matching "{listSearch}"</p>
+              </div>
+          )}
+      </div>
 
-                <button 
-                    onClick={() => setErrorModal({ isOpen: false, message: '' })}
-                    className="w-full py-3 bg-slate-700 hover:bg-slate-600 text-white rounded-xl font-medium transition-colors"
-                >
-                    Close
-                </button>
-            </div>
-        </div>
-      )}
-
-      {/* Duplicate Conflict Modal */}
+      {/* Duplicate Conflict Resolution Modal */}
       {conflictData && (
-          <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm p-4" onClick={() => {}}>
-              <div className="bg-slate-800 rounded-2xl w-full max-w-lg border border-slate-700 shadow-2xl p-6" onClick={e => e.stopPropagation()}>
-                  <div className="flex flex-col items-center text-center mb-6">
-                      <div className="w-16 h-16 bg-yellow-900/30 rounded-full flex items-center justify-center text-yellow-500 mb-4">
-                          <FileWarning size={32} />
-                      </div>
-                      <h3 className="text-xl font-bold text-white mb-2">Duplicates Detected</h3>
-                      <p className="text-slate-400 text-sm mb-4">
-                          {conflictData.duplicates.length} of the sheets in this setlist match existing sheets in your library.
-                      </p>
-                      
-                      <div className="bg-slate-900/50 rounded-lg p-3 w-full max-h-48 overflow-y-auto mb-4 border border-slate-700 text-left">
-                           <ul className="text-sm text-slate-300 space-y-1">
-                               {conflictData.duplicates.map((s, i) => (
-                                   <li key={i} className="flex items-center gap-2">
-                                       <AlertTriangle size={12} className="text-yellow-500" />
-                                       <span className="truncate">{s.name}</span>
-                                   </li>
-                               ))}
-                           </ul>
-                      </div>
-                      
-                      <p className="text-slate-500 text-xs">
-                          "Overwrite" will update existing sheets but keep metadata. "Keep Both" will create duplicates. Both options will include these sheets in the new setlist.
-                      </p>
+          <div className="fixed inset-0 z-[120] flex items-center justify-center p-4 bg-black/80 backdrop-blur-md animate-in fade-in duration-300">
+              <div className="bg-slate-900 border border-slate-700 rounded-3xl p-8 w-full max-w-lg shadow-2xl animate-in zoom-in-95 duration-200">
+                  <div className="w-16 h-16 bg-amber-500/10 rounded-full flex items-center justify-center mx-auto mb-6">
+                      <FileWarning size={32} className="text-amber-500" />
+                  </div>
+                  <h2 className="text-2xl font-bold text-white text-center mb-2">Duplicate Sheets in Setlist</h2>
+                  <p className="text-slate-400 text-center text-sm mb-6 leading-relaxed">
+                      The following sheets in your imported setlist already exist in your library.
+                  </p>
+                  
+                  <div className="max-h-48 overflow-y-auto mb-8 pr-2 space-y-2 no-scrollbar">
+                      {conflictData.duplicates.map(d => (
+                          <div key={d.id} className="flex items-center gap-3 p-3 bg-slate-800/50 rounded-xl border border-slate-700/50">
+                              <FileText size={16} className="text-slate-500" />
+                              <span className="text-sm font-medium text-white truncate flex-1">{d.name}</span>
+                              <span className="text-[10px] font-black uppercase tracking-tighter text-amber-500 bg-amber-500/10 px-2 py-0.5 rounded">Conflict</span>
+                          </div>
+                      ))}
                   </div>
 
-                  <div className="flex gap-3">
+                  <div className="flex flex-col gap-3">
                       <button 
-                          onClick={() => setConflictData(null)}
-                          className="flex-1 py-3 bg-slate-700 hover:bg-slate-600 text-white rounded-xl font-medium transition-colors"
+                        onClick={() => finalizeSetlistImport(conflictData.newSheets, true, conflictData.setlistName)} 
+                        className="w-full flex items-center justify-center gap-2 py-4 bg-blue-600 text-white rounded-2xl hover:bg-blue-500 transition-all font-bold shadow-lg shadow-blue-900/20"
                       >
-                          Cancel
+                          <RefreshCw size={20} /> Overwrite Library Content
                       </button>
                       <button 
-                          onClick={() => finalizeSetlistImport(conflictData.newSheets, false, conflictData.setlistName)}
-                          className="flex-1 py-3 bg-blue-600 hover:bg-blue-500 text-white rounded-xl font-medium transition-colors"
+                        onClick={() => finalizeSetlistImport(conflictData.newSheets, false, conflictData.setlistName)} 
+                        className="w-full flex items-center justify-center gap-2 py-4 bg-slate-800 text-white rounded-2xl hover:bg-slate-700 transition-all font-bold"
                       >
-                          <div className="flex items-center justify-center gap-2">
-                             <Copy size={16} />
-                             <span>Keep Both</span>
-                          </div>
+                          <Copy size={20} /> Keep Both (New Copies)
                       </button>
                       <button 
-                          onClick={() => finalizeSetlistImport(conflictData.newSheets, true, conflictData.setlistName)}
-                          className="flex-1 py-3 bg-yellow-600 hover:bg-yellow-500 text-white rounded-xl font-medium transition-colors"
+                        onClick={() => setConflictData(null)} 
+                        className="w-full py-3 text-slate-500 hover:text-white transition-colors text-sm font-medium"
                       >
-                          <div className="flex items-center justify-center gap-2">
-                              <Save size={16} />
-                              <span>Overwrite</span>
-                          </div>
+                          Cancel Import
                       </button>
                   </div>
               </div>
           </div>
       )}
 
-      {/* Delete Modal */}
       {deleteModal.isOpen && (
-          <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm p-4" onClick={() => setDeleteModal({ isOpen: false, setlist: null })}>
-              <div className="bg-slate-800 rounded-2xl w-full max-w-sm border border-slate-700 shadow-2xl p-6" onClick={e => e.stopPropagation()}>
-                  <div className="flex flex-col items-center text-center mb-6">
-                      <div className="w-16 h-16 bg-red-900/30 rounded-full flex items-center justify-center text-red-500 mb-4">
-                          <Trash2 size={32} />
-                      </div>
-                      <h3 className="text-xl font-bold text-white mb-2">Delete Setlist?</h3>
-                      <p className="text-slate-400 text-sm">
-                          Are you sure you want to delete <span className="font-bold text-white">"{deleteModal.setlist?.name}"</span>?
-                          This action cannot be undone. Note: Sheets in the library will NOT be deleted.
-                      </p>
-                  </div>
-
-                  <div className="flex gap-3">
-                      <button 
-                          onClick={() => setDeleteModal({ isOpen: false, setlist: null })}
-                          className="flex-1 py-3 bg-slate-700 hover:bg-slate-600 text-white rounded-xl font-medium transition-colors"
-                      >
-                          Cancel
-                      </button>
-                      <button 
-                          onClick={confirmDelete}
-                          className="flex-1 py-3 bg-red-600 hover:bg-red-500 text-white rounded-xl font-medium transition-colors shadow-lg shadow-red-900/20"
-                      >
-                          Delete
-                      </button>
-                  </div>
-              </div>
+        <div className="fixed inset-0 z-[100] flex items-center justify-center p-4 bg-black/80 backdrop-blur-sm animate-in fade-in duration-300" onClick={() => setDeleteModal({ isOpen: false, setlist: null })}>
+          <div className="bg-slate-900 border border-slate-800 rounded-3xl p-8 w-full max-w-md shadow-2xl animate-in zoom-in-95 duration-200" onClick={e => e.stopPropagation()}>
+            <div className="w-16 h-16 bg-red-500/10 rounded-full flex items-center justify-center mx-auto mb-6">
+                <AlertTriangle size={32} className="text-red-500" />
+            </div>
+            <h2 className="text-2xl font-bold text-white text-center mb-2">Delete Setlist?</h2>
+            <p className="text-slate-400 text-center text-sm mb-8 px-4 leading-relaxed">This will remove the "{deleteModal.setlist?.name}" playlist. Your library files and annotations are safe.</p>
+            <div className="flex gap-3">
+                <button onClick={() => setDeleteModal({ isOpen: false, setlist: null })} className="flex-1 py-3.5 bg-slate-800 text-white rounded-2xl hover:bg-slate-700 transition-all font-bold">Cancel</button>
+                <button onClick={confirmDelete} className="flex-1 py-3.5 bg-red-600 text-white rounded-2xl hover:bg-red-500 transition-all font-bold shadow-lg shadow-red-900/20">Delete List</button>
+            </div>
           </div>
+        </div>
       )}
     </div>
   );
