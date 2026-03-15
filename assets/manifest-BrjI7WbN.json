@@ -1,0 +1,22 @@
+{
+  "name": "GigMaster Sheet Music Reader",
+  "short_name": "GigMaster",
+  "start_url": "./index.html",
+  "display": "standalone",
+  "background_color": "#0f172a",
+  "theme_color": "#0f172a",
+  "description": "Offline-capable sheet music reader with setlist management.",
+  "orientation": "any",
+  "icons": [
+    {
+      "src": "https://cdn-icons-png.flaticon.com/512/125/125009.png",
+      "sizes": "192x192",
+      "type": "image/png"
+    },
+    {
+      "src": "https://cdn-icons-png.flaticon.com/512/125/125009.png",
+      "sizes": "512x512",
+      "type": "image/png"
+    }
+  ]
+}
